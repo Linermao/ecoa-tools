@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+
+# Virtual environments
+.venv
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Project specific
+uploads/
+outputs/
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Nix
+result*
+.direnv/

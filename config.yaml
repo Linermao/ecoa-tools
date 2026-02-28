@@ -1,0 +1,155 @@
+# ECOA Tools Configuration
+# Configuration for ECOA (European Component Oriented Architecture) Tools Backend API
+
+# Global settings
+verbose: 3
+uploads_dir: uploads
+outputs_dir: outputs
+logs_dir: logs
+
+# Projects directory (where frontend exports project files)
+# Frontend will place projects in: projects_base_dir/<project_name>/
+projects_base_dir: "/path/to/ecoa-projects"
+
+# Supported ECOA Tools
+tools:
+  # ecoa-exvt: ECOA XML Validation Tool
+  # Validates an ECOA project XML file and its references
+  exvt:
+    command: ecoa-exvt
+    name: "ECOA XML Validation Tool"
+    description: "Validates ECOA project XML files and checks all references"
+    category: "validation"
+    verbose_type: "integer" # -v accepts an integer value
+    parameters:
+      - name: project_file
+        type: file
+        required: true
+        description: "Path to the ECOA project XML file"
+        flag: "-p"
+    output_types: []
+    example: "ecoa-exvt -p marx_brothers.project.xml"
+
+  # ecoa-csmgvt: Connected System Model Generator and Verification Tool
+  # Generates a framework for functional testing of an ECOA application on desktop PC
+  csmgvt:
+    command: ecoa-csmgvt
+    name: "CSM Generator & Verification Tool"
+    description: "Generates a framework for functional testing of ECOA applications on desktop PC"
+    category: "testing"
+    verbose_type: "boolean" # -v is a flag, no value needed
+    parameters:
+      - name: project_file
+        type: file
+        required: true
+        description: "Path to the ECOA project XML file"
+        flag: "-p"
+      - name: checker
+        type: string
+        required: true
+        description: "External tool that checks ECOA XML validity (e.g., ecoa-exvt)"
+        flag: "-k"
+        default: "ecoa-exvt"
+    output_types:
+      - ".h"
+      - ".c"
+      - ".cpp"
+    example: "ecoa-csmgvt -p marx_brothers.project.xml -k ecoa-exvt"
+
+  # ecoa-mscigt: Module Skeletons and Container Interfaces Generator Tool
+  # Generates ECOA APIs from ECOA XML files
+  mscigt:
+    command: ecoa-mscigt
+    name: "Module Skeletons & Container Interfaces Generator"
+    description: "Generates ECOA API module skeletons and container interfaces from XML definitions"
+    category: "code_generation"
+    verbose_type: "boolean" # -v is a flag, no value needed
+    parameters:
+      - name: project_file
+        type: file
+        required: true
+        description: "Path to the ECOA project XML file"
+        flag: "-p"
+      - name: checker
+        type: string
+        required: true
+        description: "External tool that checks ECOA XML validity (e.g., ecoa-exvt)"
+        flag: "-k"
+        default: "ecoa-exvt"
+    output_types:
+      - ".h"
+      - ".c"
+      - ".cpp"
+    example: "ecoa-mscigt -p marx_brothers.project.xml -k ecoa-exvt"
+
+  # ecoa-asctg: Application Software Components Test Generator
+  # Generates a component harness replacing all components that are not under test
+  asctg:
+    command: ecoa-asctg
+    name: "Application Software Components Test Generator"
+    description: "Generates component harness for testing, replacing components not under test"
+    category: "testing"
+    verbose_type: "integer" # -v accepts an integer value (0-4)
+    parameters:
+      - name: project_file
+        type: file
+        required: true
+        description: "Path to the ECOA project XML file"
+        flag: "-p"
+      - name: config_file
+        type: file
+        required: true
+        description: "Path to the ECOA config XML file"
+        flag: "-c"
+      - name: checker
+        type: string
+        required: true
+        description: "External tool that checks ECOA XML validity (e.g., ecoa-exvt)"
+        flag: "-k"
+        default: "ecoa-exvt"
+    output_types:
+      - ".h"
+      - ".c"
+      - ".cpp"
+    example: "ecoa-asctg -p marx_brothers.project.xml -c ecoa_config.xml -k ecoa-exvt"
+
+  # ecoa-ldp: Lightweight Development Platform Tool
+  # Generates the source code of an ECOA application
+  ldp:
+    command: ecoa-ldp
+    name: "Lightweight Development Platform"
+    description: "Generates the complete source code of an ECOA application from XML definitions"
+    category: "code_generation"
+    verbose_type: "integer" # -v accepts an integer value (0-4)
+    parameters:
+      - name: project_file
+        type: file
+        required: true
+        description: "Path to the ECOA project XML file"
+        flag: "-p"
+      - name: checker
+        type: string
+        required: true
+        description: "Path to the ECOA XML Validation Tool (e.g., ecoa-exvt)"
+        flag: "-k"
+        default: "ecoa-exvt"
+    output_types:
+      - ".h"
+      - ".c"
+      - ".cpp"
+      - ".mk"
+      - ".cmake"
+    example: "ecoa-ldp -p marx_brothers.project.xml -k ecoa-exvt"
+
+# API settings
+api:
+  title: "ECOA Tools API"
+  version: "1.0.0"
+  description: "REST API for executing ECOA (European Component Oriented Architecture) tools"
+  max_upload_size: 16777216 # 16MB in bytes
+
+# Server settings
+server:
+  host: "0.0.0.0"
+  port: 5000
+  debug: false
