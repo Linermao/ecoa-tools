@@ -139,6 +139,14 @@ tools:
       - ".cpp"
       - ".mk"
       - ".cmake"
+    compile:
+      enabled: false
+      default_log_library: "log4cplus"
+      timeout: 600
+      cmake_options:
+        - "-DLDP_LOG_USE=${log_library}"
+      make_options:
+        - "-j"
     example: "ecoa-ldp -p marx_brothers.project.xml -k ecoa-exvt"
 
 # API settings
