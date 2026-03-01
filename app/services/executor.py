@@ -397,7 +397,7 @@ class ToolExecutor:
         verbose: int = None,
         checker: str = None,
         config_file: str = None,
-        compile: bool = False,
+        compile: Optional[bool] = None,
         log_library: str = None,
         cmake_options: List[str] = None
     ) -> Dict[str, any]:
@@ -411,7 +411,10 @@ class ToolExecutor:
             verbose: Verbosity level (overrides default)
             checker: Checker tool for validation (e.g., 'ecoa-exvt')
             config_file: Config file name (for asctg tool)
-            compile: Whether to compile the project after tool execution (for ldp tool)
+            compile: Whether to compile the project after tool execution (for ldp tool).
+                None: use configuration default (enabled: true),
+                True: always compile,
+                False: never compile
             log_library: Logging library to use for compilation (log4cplus, zlog, lttng)
             cmake_options: Additional CMake options for compilation
 
@@ -549,32 +552,44 @@ class ToolExecutor:
                 generated_files = self._find_output_files(project_path, output_types)
                 logger.info(f"Found {len(generated_files)} generated files")
 
-            # Compile project if requested and tool is ldp
+            # Compile project if tool is ldp and compilation is enabled
             compile_result = {}
-            if success and compile and tool_id == 'ldp':
+            if success and tool_id == 'ldp':
                 # Get compile configuration
                 ldp_config = self.config.get_tool('ldp')
                 compile_config = ldp_config.get('compile', {}) if ldp_config else {}
 
-                # Determine log_library value
-                if log_library is None:
-                    log_library = compile_config.get('default_log_library', 'log4cplus')
+                # Determine if compilation should be performed
+                should_compile = False
+                if compile is True:
+                    should_compile = True
+                elif compile is False:
+                    should_compile = False
+                else:  # compile is None, use configuration
+                    should_compile = compile_config.get('enabled', False)
 
-                # Determine cmake_options
-                if cmake_options is None:
-                    cmake_options = compile_config.get('cmake_options', [])
+                if should_compile:
+                    # Determine log_library value
+                    if log_library is None:
+                        log_library = compile_config.get('default_log_library', 'log4cplus')
 
-                # Determine timeout
-                timeout = compile_config.get('timeout', 600)
+                    # Determine cmake_options
+                    if cmake_options is None:
+                        cmake_options = compile_config.get('cmake_options', [])
 
-                logger.info(f"Starting compilation with log_library={log_library}")
-                compile_result = self.compile_project(
-                    project_path=project_path,
-                    log_library=log_library,
-                    cmake_options=cmake_options,
-                    timeout=timeout
-                )
-                logger.info(f"Compilation {'succeeded' if compile_result.get('compile_success') else 'failed'}")
+                    # Determine timeout
+                    timeout = compile_config.get('timeout', 600)
+
+                    logger.info(f"Starting compilation with log_library={log_library}")
+                    compile_result = self.compile_project(
+                        project_path=project_path,
+                        log_library=log_library,
+                        cmake_options=cmake_options,
+                        timeout=timeout
+                    )
+                    logger.info(f"Compilation {'succeeded' if compile_result.get('compile_success') else 'failed'}")
+                else:
+                    logger.info(f"Compilation skipped for tool {tool_id} (compile={compile}, config.enabled={compile_config.get('enabled', False)})")
 
             # Prepare result dictionary
             result_dict = {

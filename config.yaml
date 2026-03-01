@@ -140,7 +140,7 @@ tools:
       - ".mk"
       - ".cmake"
     compile:
-      enabled: false
+      enabled: true
       default_log_library: "log4cplus"
       timeout: 600
       cmake_options:

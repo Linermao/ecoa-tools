@@ -53,13 +53,13 @@ projects_base_dir: "/path/to/your/ecoa-projects"
 
 **LDP Compilation Configuration:**
 
-The `ldp` tool supports automatic compilation after code generation. Configure compilation settings in `config.yaml`:
+The `ldp` tool supports automatic compilation after code generation. By default, compilation is enabled and uses `log4cplus` logging library. Configure compilation settings in `config.yaml`:
 
 ```yaml
 ldp:
   # ... existing configuration ...
   compile:
-    enabled: false                     # Enable compilation by default
+    enabled: true                      # Enable compilation by default
     default_log_library: "log4cplus"   # Default logging library
     timeout: 600                       # Compilation timeout in seconds
     cmake_options:                     # Default CMake options
@@ -100,12 +100,7 @@ Content-Type: application/json
 {
   "project_name": "marx_brothers",
   "project_file": "marx_brothers.project.xml",
-  "tool": "ldp",
-  "compile": false,
-  "log_library": "log4cplus",
-  "cmake_options": ["-DLDP_LOG_USE=log4cplus"],
-  "verbose": 3,
-  "checker": "ecoa-exvt"
+  "tool": "ldp"
 }
 ```
 
@@ -116,33 +111,18 @@ Content-Type: application/json
 | `project_name` | string | Yes | - | Project directory name |
 | `project_file` | string | Yes | - | Project XML file name |
 | `tool` | string | Yes | `exvt` | Tool ID to execute (`ldp`, `exvt`, `csmgvt`, `mscigt`, `asctg`) |
-| `compile` | boolean | No | `false` | Whether to compile project after tool execution (for `ldp` tool only) |
-| `log_library` | string | No | `log4cplus` | Logging library for compilation (`log4cplus`, `zlog`, `lttng`) |
-| `cmake_options` | array | No | `[]` | Additional CMake options for compilation |
+| `compile` | boolean | No | `null` (use config) | Whether to compile project after tool execution (for `ldp` tool only). `null`: use config default (enabled), `true`: always compile, `false`: never compile |
+| `log_library` | string | No | `null` (use config) | Logging library for compilation (`log4cplus`, `zlog`, `lttng`). Uses config default if not specified. |
+| `cmake_options` | array | No | `null` (use config) | Additional CMake options for compilation. Uses config default if not specified. |
 | `verbose` | integer | No | `3` | Verbosity level (0-4) |
 | `checker` | string | No | `ecoa-exvt` | Checker tool for validation |
 | `config_file` | string | No | - | Config file name (required for `asctg` tool) |
 
 > **Note:** The `compile`, `log_library`, and `cmake_options` parameters only apply to the `ldp` tool. If specified for other tools, they will be ignored.
+>
+> **Default Behavior:** For `ldp` tool, compilation is enabled by default using `log4cplus` logging library. To disable compilation, set `"compile": false` in the API request.
 
-**Response (without compilation):**
-
-```json
-{
-  "success": true,
-  "tool": "ldp",
-  "project_name": "marx_brothers",
-  "project_path": "/path/to/ecoa-projects/marx_brothers",
-  "project_file": "marx_brothers.project.xml",
-  "generated_files": ["main.c", "platform.c", "CMakeLists.txt", ...],
-  "message": "Tool ldp executed successfully",
-  "stdout": "...",
-  "stderr": "...",
-  "return_code": 0
-}
-```
-
-**Response (with compilation `compile: true`):**
+**Response (default compilation enabled):**
 
 ```json
 {
@@ -166,6 +146,23 @@ Content-Type: application/json
 }
 ```
 
+**Response (with compilation disabled `compile: false`):**
+
+```json
+{
+  "success": true,
+  "tool": "ldp",
+  "project_name": "marx_brothers",
+  "project_path": "/path/to/ecoa-projects/marx_brothers",
+  "project_file": "marx_brothers.project.xml",
+  "generated_files": ["main.c", "platform.c", "CMakeLists.txt", ...],
+  "message": "Tool ldp executed successfully",
+  "stdout": "...",
+  "stderr": "...",
+  "return_code": 0
+}
+```
+
 ### Health Check
 
 ```bash
@@ -185,18 +182,18 @@ curl -X POST http://localhost:5000/api/tools/execute-project \
   -H "Content-Type: application/json" \
   -d '{"project_name": "my_project", "project_file": "project.xml", "tool": "mscigt"}'
 
-# Generate LDP platform without compilation (default behavior)
+# Generate LDP platform with default compilation (log4cplus)
 curl -X POST http://localhost:5000/api/tools/execute-project \
   -H "Content-Type: application/json" \
-  -d '{"project_name": "my_project", "project_file": "project.xml", "tool": "ldp", "checker": "ecoa-exvt"}'
+  -d '{"project_name": "my_project", "project_file": "project.xml", "tool": "ldp"}'
 
-# Generate LDP platform with compilation using log4cplus
+# Generate LDP platform with compilation disabled
 curl -X POST http://localhost:5000/api/tools/execute-project \
   -H "Content-Type: application/json" \
-  -d '{"project_name": "my_project", "project_file": "project.xml", "tool": "ldp", "compile": true, "log_library": "log4cplus", "cmake_options": ["-DLDP_LOG_USE=log4cplus"], "checker": "ecoa-exvt"}'
+  -d '{"project_name": "my_project", "project_file": "project.xml", "tool": "ldp", "compile": false}'
 
-# Generate LDP platform with compilation using zlog library
+# Generate LDP platform with compilation using zlog library (override default)
 curl -X POST http://localhost:5000/api/tools/execute-project \
   -H "Content-Type: application/json" \
-  -d '{"project_name": "my_project", "project_file": "project.xml", "tool": "ldp", "compile": true, "log_library": "zlog", "cmake_options": ["-DLDP_LOG_USE=zlog", "-DCMAKE_BUILD_TYPE=Release"], "checker": "ecoa-exvt"}'
+  -d '{"project_name": "my_project", "project_file": "project.xml", "tool": "ldp", "log_library": "zlog", "cmake_options": ["-DLDP_LOG_USE=zlog", "-DCMAKE_BUILD_TYPE=Release"]}'
 ```

@@ -237,7 +237,7 @@ def execute_in_project():
         config_file = data.get('config_file')  # Optional config file (for asctg)
 
         # Get optional compilation parameters
-        compile_param = data.get('compile', False)
+        compile_param = data.get('compile')  # None if not provided
         log_library = data.get('log_library')
         cmake_options = data.get('cmake_options')
 
@@ -247,11 +247,13 @@ def execute_in_project():
             ctx.warning(f"Invalid log_library: {log_library}")
             raise BadRequest(f"Invalid log_library: {log_library}. Must be one of {valid_log_libraries}")
 
-        # Convert compile parameter to boolean if needed
-        if isinstance(compile_param, str):
-            compile_param = compile_param.lower() in ('true', '1', 'yes')
-        else:
-            compile_param = bool(compile_param)
+        # Convert compile parameter to boolean if provided
+        if compile_param is not None:
+            if isinstance(compile_param, str):
+                compile_param = compile_param.lower() in ('true', '1', 'yes')
+            else:
+                # For JSON boolean (true/false), it's already bool
+                compile_param = bool(compile_param)
 
         # Validate cmake_options if provided
         if cmake_options is not None:
