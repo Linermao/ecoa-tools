@@ -227,6 +227,32 @@ class ToolExecutor:
 
         raise FileNotFoundError(f"CMakeLists.txt not found in project: {project_path}")
 
+    def _get_pkg_config_path(self, package: str) -> str:
+        """
+        Get package installation path using pkg-config.
+
+        Args:
+            package: Package name (e.g., 'log4cplus', 'apr-1', 'cunit')
+
+        Returns:
+            Installation path from pkg-config
+
+        Raises:
+            FileNotFoundError: If pkg-config or package is not found
+        """
+        try:
+            result = subprocess.run(
+                ["pkg-config", "--variable=prefix", package],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            return result.stdout.strip()
+        except subprocess.CalledProcessError as e:
+            raise FileNotFoundError(f"pkg-config failed for {package}: {e.stderr}")
+        except FileNotFoundError:
+            raise FileNotFoundError("pkg-config not found. Please install pkg-config.")
+
     def compile_project(
         self,
         project_path: str,
@@ -254,9 +280,6 @@ class ToolExecutor:
             # Build compile commands
             build_dir = os.path.join(cmake_dir, "build")
 
-            # Ensure build directory exists
-            Path(build_dir).mkdir(parents=True, exist_ok=True)
-
             # Get compile configuration from config
             tool_config = self.config.get_tool("ldp")
             compile_config = tool_config.get("compile", {}) if tool_config else {}
@@ -265,24 +288,56 @@ class ToolExecutor:
             default_cmake_options = compile_config.get("cmake_options", [])
             default_make_options = compile_config.get("make_options", ["-j"])
 
-            # Replace ${log_library} placeholder in cmake options
-            processed_cmake_options = []
-            for opt in (cmake_options or default_cmake_options):
-                processed_cmake_options.append(opt.replace("${log_library}", log_library))
+            # Get dependency paths using pkg-config (NixOS style)
+            try:
+                log4cplus_dir = self._get_pkg_config_path("log4cplus")
+                apr_dir = self._get_pkg_config_path("apr-1")
+                cunit_dir = self._get_pkg_config_path("cunit")
+                logger.info(f"Using pkg-config paths: log4cplus={log4cplus_dir}, apr={apr_dir}, cunit={cunit_dir}")
+            except FileNotFoundError as e:
+                logger.warning(f"Failed to get pkg-config paths: {e}")
+                raise
 
-            # Build CMake command
-            cmake_cmd = ["cmake", "..", f"-DLDP_LOG_USE={log_library}"]
-            cmake_cmd.extend(processed_cmake_options)
+            # Find cmake_config.cmake path (check project dir first, then ecoa-tools root)
+            cmake_config_path = os.path.join(cmake_dir, "cmake_config.cmake")
+            if not os.path.exists(cmake_config_path):
+                # Try ecoa-tools root directory (assuming project is under projects_base_dir)
+                ecoa_tools_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+                cmake_config_path = os.path.join(ecoa_tools_root, "cmake_config.cmake")
+                if not os.path.exists(cmake_config_path):
+                    logger.warning(f"cmake_config.cmake not found, will skip -C parameter")
+                    cmake_config_path = None
+
+            # Build CMake command with paths
+            cmake_cmd = [
+                "cmake",
+                "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",
+                f"-DAPR_DIR={apr_dir}",
+                f"-DLOG4CPLUS_DIR={log4cplus_dir}",
+                f"-DCUNIT_DIR={cunit_dir}",
+                f"-DLDP_LOG_USE={log_library}",
+                "-B", build_dir,
+                "-S", cmake_dir
+            ]
+
+            # Add cmake_config.cmake if found
+            if cmake_config_path:
+                cmake_cmd.extend(["-C", cmake_config_path])
+
+            # Add any additional cmake options
+            if cmake_options or default_cmake_options:
+                for opt in (cmake_options or default_cmake_options):
+                    cmake_cmd.append(opt.replace("${log_library}", log_library))
 
             # Build make command
             make_cmd = ["make"]
             make_cmd.extend(default_make_options)
 
-            # Execute CMake
-            logger.info(f"Running CMake in {build_dir}")
+            # Execute CMake (using -B/-S, so run from cmake_dir)
+            logger.info(f"Running CMake: {' '.join(cmake_cmd)}")
             cmake_result = subprocess.run(
                 cmake_cmd,
-                cwd=build_dir,
+                cwd=cmake_dir,  # Run from cmake_dir when using -B/-S
                 capture_output=True,
                 text=True,
                 timeout=timeout

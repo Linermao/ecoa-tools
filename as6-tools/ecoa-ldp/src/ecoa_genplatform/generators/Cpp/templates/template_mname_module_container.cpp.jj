@@ -167,7 +167,7 @@ namespace {{mname}}
 
   /* Logging services API call specifications */
   {% for i in [["raise_error","LOG_ERROR","ERROR","ECOA__error_type_ERROR"],["raise_fatal_error","LOG_FATAL","FATAL","ECOA__error_type_FATAL_ERROR"]] %}
-  void Container::{{i[0]}}(const ECOA::log &log){
+  void Container::{{i[0]}}(const ECOA::log &log, const ECOA::error_code error_code){
     ldp_module_context* ctx=(ldp_module_context*) this->hook;
     ldp_send_fault_error_to_father(ctx->component_ctx, ctx->mod_id, ECOA__asset_type_COMPONENT, {{i[3]}}, 1);
     ldp__timestamp timestamp;
