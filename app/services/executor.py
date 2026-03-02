@@ -190,6 +190,205 @@ class ToolExecutor:
         else:
             return f'Tool {tool_id} execution failed with code {return_code}'
 
+    def _find_cmakelists_dir(self, project_path: str) -> str:
+        """
+        Find directory containing CMakeLists.txt in project.
+
+        Args:
+            project_path: Project root directory
+
+        Returns:
+            Path to directory containing CMakeLists.txt
+
+        Raises:
+            FileNotFoundError: If CMakeLists.txt not found
+        """
+        # Common output directory names
+        common_output_dirs = ["6-output", "6-Output", "Output", "output", "build-output"]
+
+        # First check common output directories
+        for dir_name in common_output_dirs:
+            candidate = os.path.join(project_path, dir_name)
+            if os.path.exists(candidate) and os.path.isdir(candidate):
+                # Check if CMakeLists.txt is in this directory
+                cmake_path = os.path.join(candidate, "CMakeLists.txt")
+                if os.path.exists(cmake_path):
+                    return candidate
+                # Check parent directory (as per cmake_generator.py pattern)
+                parent_dir = os.path.dirname(candidate)
+                cmake_path = os.path.join(parent_dir, "CMakeLists.txt")
+                if os.path.exists(cmake_path):
+                    return parent_dir
+
+        # Recursive search in project directory
+        for root, dirs, files in os.walk(project_path):
+            if "CMakeLists.txt" in files:
+                return root
+
+        raise FileNotFoundError(f"CMakeLists.txt not found in project: {project_path}")
+
+    def compile_project(
+        self,
+        project_path: str,
+        log_library: str = "log4cplus",
+        cmake_options: List[str] = None,
+        timeout: int = 600
+    ) -> Dict[str, any]:
+        """
+        Execute CMake compilation in project directory.
+
+        Args:
+            project_path: Project root directory
+            log_library: Logging library to use (log4cplus, zlog, lttng)
+            cmake_options: Additional CMake options
+            timeout: Compilation timeout in seconds
+
+        Returns:
+            Dictionary with compilation results
+        """
+        try:
+            # Find CMakeLists.txt directory
+            cmake_dir = self._find_cmakelists_dir(project_path)
+            logger.info(f"Compiling in directory: {cmake_dir}")
+
+            # Build compile commands
+            build_dir = os.path.join(cmake_dir, "build")
+
+            # Ensure build directory exists
+            Path(build_dir).mkdir(parents=True, exist_ok=True)
+
+            # Get compile configuration from config
+            tool_config = self.config.get_tool("ldp")
+            compile_config = tool_config.get("compile", {}) if tool_config else {}
+
+            # Get default options from config
+            default_cmake_options = compile_config.get("cmake_options", [])
+            default_make_options = compile_config.get("make_options", ["-j"])
+
+            # Replace ${log_library} placeholder in cmake options
+            processed_cmake_options = []
+            for opt in (cmake_options or default_cmake_options):
+                processed_cmake_options.append(opt.replace("${log_library}", log_library))
+
+            # Build CMake command
+            cmake_cmd = ["cmake", "..", f"-DLDP_LOG_USE={log_library}"]
+            cmake_cmd.extend(processed_cmake_options)
+
+            # Build make command
+            make_cmd = ["make"]
+            make_cmd.extend(default_make_options)
+
+            # Execute CMake
+            logger.info(f"Running CMake in {build_dir}")
+            cmake_result = subprocess.run(
+                cmake_cmd,
+                cwd=build_dir,
+                capture_output=True,
+                text=True,
+                timeout=timeout
+            )
+
+            cmake_success = cmake_result.returncode == 0
+
+            # Execute make only if CMake succeeded
+            make_result = None
+            if cmake_success:
+                logger.info(f"Running make in {build_dir}")
+                make_result = subprocess.run(
+                    make_cmd,
+                    cwd=build_dir,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout
+                )
+            else:
+                # Create dummy make result for consistency
+                make_result = subprocess.CompletedProcess(
+                    args=make_cmd,
+                    returncode=-1,
+                    stdout="",
+                    stderr="CMake failed, make not executed"
+                )
+
+            # Find executable files in build/bin or build directory
+            executable_files = []
+            bin_dir = os.path.join(build_dir, "bin")
+            if os.path.exists(bin_dir):
+                for file in os.listdir(bin_dir):
+                    file_path = os.path.join(bin_dir, file)
+                    if os.path.isfile(file_path) and os.access(file_path, os.X_OK):
+                        executable_files.append(file)
+            else:
+                # Check build directory directly
+                for file in os.listdir(build_dir):
+                    file_path = os.path.join(build_dir, file)
+                    if os.path.isfile(file_path) and os.access(file_path, os.X_OK):
+                        executable_files.append(file)
+
+            compile_success = cmake_success and (make_result.returncode == 0 if make_result else False)
+
+            # Combine stdout and stderr
+            combined_stdout = ""
+            combined_stderr = ""
+            if cmake_result:
+                combined_stdout += f"=== CMake Output ===\n{cmake_result.stdout}\n"
+                combined_stderr += f"=== CMake Errors ===\n{cmake_result.stderr}\n"
+            if make_result:
+                combined_stdout += f"=== Make Output ===\n{make_result.stdout}\n"
+                combined_stderr += f"=== Make Errors ===\n{make_result.stderr}\n"
+
+            return {
+                "compile_success": compile_success,
+                "compile_stdout": combined_stdout.strip(),
+                "compile_stderr": combined_stderr.strip(),
+                "compile_return_code": make_result.returncode if make_result else cmake_result.returncode,
+                "executable_files": executable_files,
+                "cmake_dir": cmake_dir,
+                "build_dir": build_dir,
+                "cmake_command": " ".join(cmake_cmd),
+                "make_command": " ".join(make_cmd) if make_cmd else ""
+            }
+
+        except subprocess.TimeoutExpired:
+            logger.error(f"Compilation timeout in project: {project_path}")
+            return {
+                "compile_success": False,
+                "compile_stdout": "",
+                "compile_stderr": "Compilation timeout",
+                "compile_return_code": -1,
+                "executable_files": [],
+                "cmake_dir": "",
+                "build_dir": "",
+                "cmake_command": "",
+                "make_command": ""
+            }
+        except FileNotFoundError as e:
+            logger.error(f"CMakeLists.txt not found: {e}")
+            return {
+                "compile_success": False,
+                "compile_stdout": "",
+                "compile_stderr": str(e),
+                "compile_return_code": -1,
+                "executable_files": [],
+                "cmake_dir": "",
+                "build_dir": "",
+                "cmake_command": "",
+                "make_command": ""
+            }
+        except Exception as e:
+            logger.exception(f"Unexpected compilation error: {e}")
+            return {
+                "compile_success": False,
+                "compile_stdout": "",
+                "compile_stderr": f"Unexpected error: {str(e)}",
+                "compile_return_code": -1,
+                "executable_files": [],
+                "cmake_dir": "",
+                "build_dir": "",
+                "cmake_command": "",
+                "make_command": ""
+            }
+
     def execute_in_project(
         self,
         tool_id: str,
@@ -197,7 +396,10 @@ class ToolExecutor:
         project_file: str,
         verbose: int = None,
         checker: str = None,
-        config_file: str = None
+        config_file: str = None,
+        compile: Optional[bool] = None,
+        log_library: str = None,
+        cmake_options: List[str] = None
     ) -> Dict[str, any]:
         """
         Execute a tool in a project directory.
@@ -209,6 +411,12 @@ class ToolExecutor:
             verbose: Verbosity level (overrides default)
             checker: Checker tool for validation (e.g., 'ecoa-exvt')
             config_file: Config file name (for asctg tool)
+            compile: Whether to compile the project after tool execution (for ldp tool).
+                None: use configuration default (enabled: true),
+                True: always compile,
+                False: never compile
+            log_library: Logging library to use for compilation (log4cplus, zlog, lttng)
+            cmake_options: Additional CMake options for compilation
 
         Returns:
             Dictionary with execution result:
@@ -222,7 +430,14 @@ class ToolExecutor:
                 'stdout': str,
                 'stderr': str,
                 'return_code': int,
-                'message': str
+                'message': str,
+                'compile_success': bool (optional),
+                'compile_stdout': str (optional),
+                'compile_stderr': str (optional),
+                'compile_return_code': int (optional),
+                'executable_files': List[str] (optional),
+                'cmake_dir': str (optional),
+                'build_dir': str (optional)
             }
 
         Raises:
@@ -337,7 +552,47 @@ class ToolExecutor:
                 generated_files = self._find_output_files(project_path, output_types)
                 logger.info(f"Found {len(generated_files)} generated files")
 
-            return {
+            # Compile project if tool is ldp and compilation is enabled
+            compile_result = {}
+            if success and tool_id == 'ldp':
+                # Get compile configuration
+                ldp_config = self.config.get_tool('ldp')
+                compile_config = ldp_config.get('compile', {}) if ldp_config else {}
+
+                # Determine if compilation should be performed
+                should_compile = False
+                if compile is True:
+                    should_compile = True
+                elif compile is False:
+                    should_compile = False
+                else:  # compile is None, use configuration
+                    should_compile = compile_config.get('enabled', False)
+
+                if should_compile:
+                    # Determine log_library value
+                    if log_library is None:
+                        log_library = compile_config.get('default_log_library', 'log4cplus')
+
+                    # Determine cmake_options
+                    if cmake_options is None:
+                        cmake_options = compile_config.get('cmake_options', [])
+
+                    # Determine timeout
+                    timeout = compile_config.get('timeout', 600)
+
+                    logger.info(f"Starting compilation with log_library={log_library}")
+                    compile_result = self.compile_project(
+                        project_path=project_path,
+                        log_library=log_library,
+                        cmake_options=cmake_options,
+                        timeout=timeout
+                    )
+                    logger.info(f"Compilation {'succeeded' if compile_result.get('compile_success') else 'failed'}")
+                else:
+                    logger.info(f"Compilation skipped for tool {tool_id} (compile={compile}, config.enabled={compile_config.get('enabled', False)})")
+
+            # Prepare result dictionary
+            result_dict = {
                 'success': success,
                 'tool': tool_id,
                 'project_name': project_name,
@@ -349,6 +604,20 @@ class ToolExecutor:
                 'return_code': result.returncode,
                 'message': self._get_message(result.returncode, tool_id)
             }
+
+            # Add compilation results if available
+            if compile_result:
+                result_dict.update({
+                    'compile_success': compile_result.get('compile_success', False),
+                    'compile_stdout': compile_result.get('compile_stdout', ''),
+                    'compile_stderr': compile_result.get('compile_stderr', ''),
+                    'compile_return_code': compile_result.get('compile_return_code', -1),
+                    'executable_files': compile_result.get('executable_files', []),
+                    'cmake_dir': compile_result.get('cmake_dir', ''),
+                    'build_dir': compile_result.get('build_dir', '')
+                })
+
+            return result_dict
 
         except subprocess.TimeoutExpired:
             logger.error(f"Tool execution timeout: {command}")

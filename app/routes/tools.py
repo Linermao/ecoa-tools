@@ -181,7 +181,10 @@ def execute_in_project():
             "tool": "asctg",
             "checker": "ecoa-exvt",
             "config_file": "ecoa_config.xml",
-            "verbose": 3
+            "verbose": 3,
+            "compile": false,
+            "log_library": "log4cplus",
+            "cmake_options": ["-DLDP_LOG_USE=log4cplus"]
         }
 
     Parameters:
@@ -191,6 +194,9 @@ def execute_in_project():
         - checker (optional): Checker tool for validation (default: ecoa-exvt)
         - config_file (optional): Config file name (required for asctg)
         - verbose (optional): Verbosity level (default: 3)
+        - compile (optional): Whether to compile project after tool execution (for ldp tool only, default: false)
+        - log_library (optional): Logging library for compilation (log4cplus, zlog, lttng, default: log4cplus)
+        - cmake_options (optional): Additional CMake options for compilation (array of strings)
 
     Returns:
         JSON response with execution result:
@@ -204,7 +210,14 @@ def execute_in_project():
             "message": "...",
             "stdout": "...",
             "stderr": "...",
-            "return_code": 0
+            "return_code": 0,
+            "compile_success": false (optional, present if compile=true),
+            "compile_stdout": "..." (optional),
+            "compile_stderr": "..." (optional),
+            "compile_return_code": -1 (optional),
+            "executable_files": [] (optional),
+            "cmake_dir": "" (optional),
+            "build_dir": "" (optional)
         }
     """
     with RequestContext(logger) as ctx:
@@ -223,6 +236,35 @@ def execute_in_project():
         checker = data.get('checker')  # Optional checker parameter
         config_file = data.get('config_file')  # Optional config file (for asctg)
 
+        # Get optional compilation parameters
+        compile_param = data.get('compile')  # None if not provided
+        log_library = data.get('log_library')
+        cmake_options = data.get('cmake_options')
+
+        # Validate log_library if provided
+        valid_log_libraries = ["log4cplus", "zlog", "lttng"]
+        if log_library is not None and log_library not in valid_log_libraries:
+            ctx.warning(f"Invalid log_library: {log_library}")
+            raise BadRequest(f"Invalid log_library: {log_library}. Must be one of {valid_log_libraries}")
+
+        # Convert compile parameter to boolean if provided
+        if compile_param is not None:
+            if isinstance(compile_param, str):
+                compile_param = compile_param.lower() in ('true', '1', 'yes')
+            else:
+                # For JSON boolean (true/false), it's already bool
+                compile_param = bool(compile_param)
+
+        # Validate cmake_options if provided
+        if cmake_options is not None:
+            if not isinstance(cmake_options, list):
+                ctx.warning(f"Invalid cmake_options type: {type(cmake_options)}")
+                raise BadRequest("cmake_options must be a list of strings")
+            for opt in cmake_options:
+                if not isinstance(opt, str):
+                    ctx.warning(f"Invalid cmake_option type: {type(opt)}")
+                    raise BadRequest("All cmake_options must be strings")
+
         # Validate parameters
         if not project_name:
             ctx.warning("Missing project_name")
@@ -232,7 +274,11 @@ def execute_in_project():
             ctx.warning("Missing project_file")
             raise BadRequest("Missing required parameter: project_file")
 
-        ctx.info(f"Project: {project_name}, File: {project_file}, Tool: {tool_id}, Checker: {checker or 'default'}, Config: {config_file or 'N/A'}")
+        ctx.info(f"Project: {project_name}, File: {project_file}, Tool: {tool_id}, Checker: {checker or 'default'}, Config: {config_file or 'N/A'}, Compile: {compile_param}, LogLibrary: {log_library or 'default'}, CMakeOptions: {len(cmake_options) if cmake_options else 0}")
+
+        # Warn if compile is requested for non-ldp tools
+        if compile_param and tool_id != 'ldp':
+            ctx.warning(f"Compilation requested for non-ldp tool: {tool_id}. Compilation will be ignored.")
 
         # Validate tool exists
         if not config.get_tool(tool_id):
@@ -247,14 +293,18 @@ def execute_in_project():
 
         # Execute tool in project directory
         try:
-            result = executor.execute_in_project(tool_id, project_name, project_file, verbose, checker, config_file)
+            result = executor.execute_in_project(
+                tool_id, project_name, project_file, verbose, checker, config_file,
+                compile=compile_param, log_library=log_library, cmake_options=cmake_options
+            )
 
             if result['success']:
                 ctx.info(f"Tool executed successfully, generated: {len(result['generated_files'])} files")
             else:
                 ctx.error(f"Tool execution failed: {result['message']}")
 
-            return jsonify({
+            # Create base response
+            response_data = {
                 'success': result['success'],
                 'tool': result['tool'],
                 'project_name': result['project_name'],
@@ -265,7 +315,21 @@ def execute_in_project():
                 'stdout': result['stdout'],
                 'stderr': result['stderr'],
                 'return_code': result['return_code']
-            })
+            }
+
+            # Add compilation results if present
+            if 'compile_success' in result:
+                response_data.update({
+                    'compile_success': result.get('compile_success', False),
+                    'compile_stdout': result.get('compile_stdout', ''),
+                    'compile_stderr': result.get('compile_stderr', ''),
+                    'compile_return_code': result.get('compile_return_code', -1),
+                    'executable_files': result.get('executable_files', []),
+                    'cmake_dir': result.get('cmake_dir', ''),
+                    'build_dir': result.get('build_dir', '')
+                })
+
+            return jsonify(response_data)
 
         except ProjectNotFoundError as e:
             ctx.error(f"Project not found: {e}")
