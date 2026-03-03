@@ -1,0 +1,2 @@
+[console_scripts]
+ecoa-ldp = ecoa_genplatform.__main__:main

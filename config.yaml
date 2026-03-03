@@ -9,7 +9,7 @@ logs_dir: logs
 
 # Projects directory (where frontend exports project files)
 # Frontend will place projects in: projects_base_dir/<project_name>/
-projects_base_dir: "/path/to/ecoa-projects"
+projects_base_dir: "/home/wenjiec/ecoa/ceshi"
 
 # Supported ECOA Tools
 tools:

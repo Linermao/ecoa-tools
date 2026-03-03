@@ -53,6 +53,18 @@ class CMakeListsGenerator(CommonCMakeListsGenerator):
             + Common.LINE_BREAK[:2]
             + "cmake_minimum_required(VERSION 3.0)"
             + Common.LINE_BREAK[:2]
+            +"set(CMAKE_CXX_STANDARD 11)"
+            + Common.LINE_BREAK[:2]
+            +"set(CMAKE_CXX_STANDARD_REQUIRED ON)"
+            + Common.LINE_BREAK[:2]
+            +"set(CMAKE_C_STANDARD 99)"
+            + Common.LINE_BREAK[:2]
+            +"set(CMAKE_C_STANDARD_REQUIRED ON)"
+            + Common.LINE_BREAK[:2]
+            +"set(CMAKE_C_EXTENSIONS OFF)"
+            + Common.LINE_BREAK[:2]
+            +"add_definitions(-D ECOA_64BIT_SUPPORT)"
+            + Common.LINE_BREAK[:2]
         )
         # set PROJECT_NAME
         generation += "# Setting the project name" + Common.LINE_BREAK[:2] + "project(csm)" + Common.LINE_BREAK[:2]
@@ -224,9 +236,6 @@ class CMakeListsGenerator(CommonCMakeListsGenerator):
             + "-Wextra"
             + Common.LINE_BREAK[:1]
             + Common.SPACE_INDENTATION[:12]
-            + "-ansi"
-            + Common.LINE_BREAK[:1]
-            + Common.SPACE_INDENTATION[:12]
             + "-pedantic"
             + Common.LINE_BREAK[:1]
             + Common.SPACE_INDENTATION[:12]
@@ -251,9 +260,6 @@ class CMakeListsGenerator(CommonCMakeListsGenerator):
             + "-Wextra"
             + Common.LINE_BREAK[:1]
             + Common.SPACE_INDENTATION[:12]
-            + "-ansi"
-            + Common.LINE_BREAK[:1]
-            + Common.SPACE_INDENTATION[:12]
             + "-pedantic"
             + Common.LINE_BREAK[:1]
             + Common.SPACE_INDENTATION[:12]
@@ -272,8 +278,13 @@ class CMakeListsGenerator(CommonCMakeListsGenerator):
         for component_impl_name, module_impl_names in self._components.items():
             for module_impl_name in module_impl_names:
                 generation += "add_subdirectory(" + component_impl_name + "/" + module_impl_name + ")"
-                generation += Common.LINE_BREAK[:1]
+                generation += Common.LINE_BREAK[:1]      
         generation += Common.LINE_BREAK[:1]
+        for component_impl_name, module_impl_names in self._components.items():
+            for module_impl_name in module_impl_names:
+                generation+="target_compile_options("+module_impl_name+" PRIVATE -std=c99)"
+                generation += Common.LINE_BREAK[:1]
+        generation += Common.LINE_BREAK[:1]               
         return generation
 
     def _generate_target_include_directories(self) -> str:

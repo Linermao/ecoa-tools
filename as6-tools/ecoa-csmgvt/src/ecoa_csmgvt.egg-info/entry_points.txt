@@ -1,0 +1,2 @@
+[console_scripts]
+ecoa-csmgvt = csmgvt.__main__:main
