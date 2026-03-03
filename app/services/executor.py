@@ -453,7 +453,8 @@ class ToolExecutor:
         config_file: str = None,
         compile: Optional[bool] = None,
         log_library: str = None,
-        cmake_options: List[str] = None
+        cmake_options: List[str] = None,
+        additional_args: List[str] = None
     ) -> Dict[str, any]:
         """
         Execute a tool in a project directory.
@@ -582,6 +583,9 @@ class ToolExecutor:
         else:
             # Integer type: add -v with value
             cmd.extend(['-v', str(verbose)])
+
+        if additional_args:
+            cmd.extend(additional_args)
 
         logger.info(f"Executing tool '{tool_id}' in project '{project_name}'")
         logger.debug(f"Command: {' '.join(cmd)}")

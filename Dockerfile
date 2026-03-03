@@ -2,7 +2,7 @@
 FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
-WORKDIR /workspace
+WORKDIR /app
 
 # -------------------------------------------------------------------
 # Switch to TUNA mirrors
@@ -40,15 +40,15 @@ RUN apt-get update && apt-get install -y \
 # -------------------------------------------------------------------
 # Copy project
 # -------------------------------------------------------------------
-COPY . /workspace/
+COPY . /app/
 
 # -------------------------------------------------------------------
 # Create venv (python3 == 3.10)
 # -------------------------------------------------------------------
-RUN python3 -m venv /workspace/.venv
+RUN python3 -m venv /app/.venv
 
-ENV VIRTUAL_ENV=/workspace/.venv
-ENV PATH="/workspace/.venv/bin:$PATH"
+ENV VIRTUAL_ENV=/app/.venv
+ENV PATH="/app/.venv/bin:$PATH"
 
 # -------------------------------------------------------------------
 # pip mirror (TUNA)
@@ -73,8 +73,8 @@ RUN for d in \
     ecoa-mscigt \
     ecoa-asctg \
     ecoa-ldp; do \
-        if [ -d "/workspace/as6-tools/$d" ]; then \
-            pip install -e "/workspace/as6-tools/$d"; \
+        if [ -d "/app/as6-tools/$d" ]; then \
+            pip install -e "/app/as6-tools/$d"; \
         fi; \
     done
 

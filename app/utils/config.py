@@ -78,8 +78,8 @@ class Config:
 
     @property
     def projects_base_dir(self) -> str:
-        """Get projects base directory path."""
-        return self.get('projects_base_dir', 'projects')
+        """Get projects base directory path. Env var ECOA_PROJECTS_BASE_DIR takes precedence."""
+        return os.environ.get('ECOA_PROJECTS_BASE_DIR') or self.get('projects_base_dir', 'projects')
 
     @property
     def tools(self) -> Dict[str, Any]:
