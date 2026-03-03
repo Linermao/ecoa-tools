@@ -8,9 +8,10 @@ from typing import Dict, List, Optional, Tuple
 from datetime import datetime
 
 from app.utils.config import get_config
-from app.utils.logger import get_logger
+from app.utils.logger import setup_logger
 
-logger = get_logger(__name__)
+# Initialize logger for this module
+logger = setup_logger('app.services.executor')
 
 
 class ProjectNotFoundError(Exception):
@@ -281,6 +282,34 @@ class ToolExecutor:
 
             # Build compile commands
             build_dir = os.path.join(cmake_dir, "build")
+            os.makedirs(build_dir, exist_ok=True)
+
+            # Get dependency paths using pkg-config (NixOS style)
+            try:
+                log4cplus_dir = self._get_pkg_config_path("log4cplus")
+                apr_dir = self._get_pkg_config_path("apr-1")
+                cunit_dir = self._get_pkg_config_path("cunit")
+                logger.info(f"Using pkg-config paths: log4cplus={log4cplus_dir}, apr={apr_dir}, cunit={cunit_dir}")
+            except FileNotFoundError as e:
+                logger.warning(f"Failed to get pkg-config paths: {e}")
+                raise
+
+            # Find cmake_config.cmake path (check project dir first, then ecoa-tools root)
+            cmake_config_path = os.path.join(cmake_dir, "cmake_config.cmake")
+            if not os.path.exists(cmake_config_path):
+                # Try ecoa-tools root directory (assuming project is under projects_base_dir)
+                ecoa_tools_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+                cmake_config_path = os.path.join(ecoa_tools_root, "cmake_config.cmake")
+                if not os.path.exists(cmake_config_path):
+                    logger.warning(f"cmake_config.cmake not found, will skip -C parameter")
+                    cmake_config_path = None
+
+            # Convert to absolute path to avoid CMake path resolution issues
+            if cmake_config_path:
+                cmake_config_path = os.path.abspath(cmake_config_path)
+                logger.info(f"Using cmake_config.cmake: {cmake_config_path}")
+            else:
+                logger.info("No cmake_config.cmake found, skipping -C parameter")
 
             # Get compile configuration from config
             tool_config = self.config.get_tool(tool_id)
@@ -377,16 +406,23 @@ class ToolExecutor:
 
             cmake_success = cmake_result.returncode == 0
 
+            # Build make command
+            make_cmd = [
+                "make",
+                "--no-print-directory",
+                "-C", build_dir,
+                "all",
+            ]
+
             # Execute make only if CMake succeeded
             make_result = None
             if cmake_success:
-                logger.info(f"Running make in {build_dir}")
+                logger.info(f"Running make {' '.join(make_cmd)}")
                 make_result = subprocess.run(
                     make_cmd,
-                    cwd=build_dir,
                     capture_output=True,
                     text=True,
-                    timeout=timeout
+                    timeout=timeout,
                 )
             else:
                 # Create dummy make result for consistency
@@ -486,7 +522,8 @@ class ToolExecutor:
         config_file: str = None,
         compile: Optional[bool] = None,
         log_library: str = None,
-        cmake_options: List[str] = None
+        cmake_options: List[str] = None,
+        additional_args: List[str] = None
     ) -> Dict[str, any]:
         """
         Execute a tool in a project directory.
@@ -615,6 +652,9 @@ class ToolExecutor:
         else:
             # Integer type: add -v with value
             cmd.extend(['-v', str(verbose)])
+
+        if additional_args:
+            cmd.extend(additional_args)
 
         logger.info(f"Executing tool '{tool_id}' in project '{project_name}'")
         logger.debug(f"Command: {' '.join(cmd)}")

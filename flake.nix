@@ -105,7 +105,7 @@
             for tool in ${builtins.toString ecoaTools}; do
               if [ -d "as6-tools/$tool" ]; then
                 echo "  → Installing $tool"
-                pip install -e "as6-tools/$tool" --no-build-isolation --no-deps --quiet 2>/dev/null && \
+                pip install -e "as6-tools/$tool" --no-build-isolation --no-deps --quiet && \
                   installed_tools+=("$tool")
               fi
             done
@@ -118,11 +118,6 @@
             echo "  GCC:    $(gcc --version | head -n1)"
             echo "  CMake:  $(cmake --version | head -n1)"
             echo "  Venv:   $VENV"
-            echo ""
-
-            # Install Flask API dependencies
-            echo "📦 Installing Flask API dependencies..."
-            pip install -r requirements.txt --quiet
             echo ""
 
             # Set CMAKE_PREFIX_PATH for CMake to find libraries

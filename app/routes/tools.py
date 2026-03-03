@@ -4,11 +4,11 @@ from flask import Blueprint, request, jsonify, current_app
 from werkzeug.exceptions import BadRequest, NotFound, InternalServerError
 
 from app.utils.config import get_config
-from app.utils.logger import get_logger, RequestContext
+from app.utils.logger import setup_logger, RequestContext
 from app.services.executor import ToolExecutor, ProjectNotFoundError, ProjectFileNotFoundError
 
 bp = Blueprint('tools', __name__, url_prefix='/api/tools')
-logger = get_logger(__name__)
+logger = setup_logger('app.routes.tools')
 executor = ToolExecutor()
 config = get_config()
 

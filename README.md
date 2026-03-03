@@ -43,6 +43,38 @@ pip install -e ./ecoa-ldp
 cd ..
 ```
 
+### Docker (Alternative)
+
+Build and run using Docker CLI standalone:
+
+```bash
+# 1. Build Docker image
+docker build -t ecoa-tools .
+
+# 2. Create the shared workspace directory (on host)
+mkdir -p ../workspace
+
+# 3. Run container in background, mounting the shared workspace
+# (On Linux/Mac)
+docker run -d \
+  -p 5000:5000 \
+  -v "$(pwd)/../workspace:/workspace" \
+  -e ECOA_PROJECTS_BASE_DIR=/workspace \
+  --name ecoa-tools-service \
+  ecoa-tools:latest
+
+# (On Windows PowerShell)
+docker run -d `
+  -p 5000:5000 `
+  -v "$((Resolve-Path "..\workspace").Path):/workspace" `
+  -e ECOA_PROJECTS_BASE_DIR=/workspace `
+  --name ecoa-tools-service `
+  ecoa-tools:latest
+
+# debug
+docker run -it -p 5000:5000 -v "$(pwd)/../workspace:/workspace" -e ECOA_PROJECTS_BASE_DIR=/workspace ecoa-tools /bin/bash
+```
+
 **Configure `config.yaml` before starting:**
 
 ```yaml
@@ -162,6 +194,33 @@ Content-Type: application/json
   "return_code": 0
 }
 ```
+
+### Execute Full Pipeline
+
+```bash
+POST /api/generate
+Content-Type: application/json
+
+{
+    "taskId": "task-uuid",
+    "projectId": "project-uuid",
+    "stepsDir": "/workspace/project-uuid/Steps",
+    "outputDir": "/workspace/project-uuid/src",
+    "callbackUrl": "http://sirius-web:8080/api/internal/tasks/task-uuid/status",
+    "selectedPhases": ["EXVT", "MSCIGT_ASCTG", "CSMGVT", "LDP"],
+    "continueOnError": false
+}
+```
+
+This endpoint executes the full ECOA toolchain pipeline asynchronously:
+1. Calls the Java backend (`SIRIUS_WEB_URL/api/edt/ecoa/export-to-disk/{projectId}`) to export the ECOA XML into the shared workspace.
+2. In a background thread, sequentially executes the selected phases using local `ToolExecutor` (no HTTP overhead).
+3. Posts progress updates and logs to `callbackUrl`.
+
+**Required Environment Variables:**
+- `SIRIUS_WEB_URL`: URL of the Java backend (e.g. `http://sirius-web-full:8080`)
+- `ECOA_WORKSPACE`: Path to the shared workspace volume (e.g. `/workspace`)
+- `ECOA_PROJECTS_BASE_DIR`: Should match `ECOA_WORKSPACE` for project resolution
 
 ### Health Check
 

@@ -38,6 +38,9 @@ def create_app(config_path: str = "config.yaml"):
 
     # Register blueprints
     app.register_blueprint(tools_bp)
+    
+    from app.routes.generator import bp as generator_bp
+    app.register_blueprint(generator_bp)
 
     # Root endpoint
     @app.route('/')
