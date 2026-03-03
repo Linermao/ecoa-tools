@@ -9,7 +9,7 @@ logs_dir: logs
 
 # Projects directory (where frontend exports project files)
 # Frontend will place projects in: projects_base_dir/<project_name>/
-projects_base_dir: "/home/wenjiec/ecoa/ceshi"
+projects_base_dir: "/path/to/projects"
 
 # Supported ECOA Tools
 tools:
@@ -55,6 +55,11 @@ tools:
       - ".c"
       - ".cpp"
     example: "ecoa-csmgvt -p marx_brothers.project.xml -k ecoa-exvt"
+    compile:
+      enabled: true
+      timeout: 600
+      make_options:
+        - "-j"
 
   # ecoa-mscigt: Module Skeletons and Container Interfaces Generator Tool
   # Generates ECOA APIs from ECOA XML files

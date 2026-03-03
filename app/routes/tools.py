@@ -276,9 +276,9 @@ def execute_in_project():
 
         ctx.info(f"Project: {project_name}, File: {project_file}, Tool: {tool_id}, Checker: {checker or 'default'}, Config: {config_file or 'N/A'}, Compile: {compile_param}, LogLibrary: {log_library or 'default'}, CMakeOptions: {len(cmake_options) if cmake_options else 0}")
 
-        # Warn if compile is requested for non-ldp tools
-        if compile_param and tool_id != 'ldp':
-            ctx.warning(f"Compilation requested for non-ldp tool: {tool_id}. Compilation will be ignored.")
+        # Warn if compile is requested for non-ldp/csmgvt tools
+        if compile_param and tool_id not in ['ldp', 'csmgvt']:
+            ctx.warning(f"Compilation requested for tool {tool_id} which doesn't support compilation. Compilation will be ignored.")
 
         # Validate tool exists
         if not config.get_tool(tool_id):

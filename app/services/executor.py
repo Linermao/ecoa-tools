@@ -258,7 +258,8 @@ class ToolExecutor:
         project_path: str,
         log_library: str = "log4cplus",
         cmake_options: List[str] = None,
-        timeout: int = 600
+        timeout: int = 600,
+        tool_id: str = "ldp"
     ) -> Dict[str, any]:
         """
         Execute CMake compilation in project directory.
@@ -268,6 +269,7 @@ class ToolExecutor:
             log_library: Logging library to use (log4cplus, zlog, lttng)
             cmake_options: Additional CMake options
             timeout: Compilation timeout in seconds
+            tool_id: Tool identifier (ldp or csmgvt)
 
         Returns:
             Dictionary with compilation results
@@ -281,67 +283,97 @@ class ToolExecutor:
             build_dir = os.path.join(cmake_dir, "build")
 
             # Get compile configuration from config
-            tool_config = self.config.get_tool("ldp")
+            tool_config = self.config.get_tool(tool_id)
             compile_config = tool_config.get("compile", {}) if tool_config else {}
 
             # Get default options from config
             default_cmake_options = compile_config.get("cmake_options", [])
             default_make_options = compile_config.get("make_options", ["-j"])
 
-            # Get dependency paths using pkg-config (NixOS style)
-            try:
-                log4cplus_dir = self._get_pkg_config_path("log4cplus")
-                apr_dir = self._get_pkg_config_path("apr-1")
-                cunit_dir = self._get_pkg_config_path("cunit")
-                logger.info(f"Using pkg-config paths: log4cplus={log4cplus_dir}, apr={apr_dir}, cunit={cunit_dir}")
-            except FileNotFoundError as e:
-                logger.warning(f"Failed to get pkg-config paths: {e}")
-                raise
+            if tool_id == "csmgvt":
+                # Simple compilation for csmgvt: mkdir build; cd build; cmake ..; make
+                logger.info(f"Using simple compilation for {tool_id}")
 
-            # Find cmake_config.cmake path (check project dir first, then ecoa-tools root)
-            cmake_config_path = os.path.join(cmake_dir, "cmake_config.cmake")
-            if not os.path.exists(cmake_config_path):
-                # Try ecoa-tools root directory (assuming project is under projects_base_dir)
-                ecoa_tools_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-                cmake_config_path = os.path.join(ecoa_tools_root, "cmake_config.cmake")
+                # Ensure build directory exists
+                os.makedirs(build_dir, exist_ok=True)
+
+                # Simple CMake command: cmake .. (run from build directory)
+                cmake_cmd = ["cmake", ".."]
+
+                # Simple make command
+                make_cmd = ["make"]
+                make_cmd.extend(default_make_options)
+
+                # No cmake_config.cmake for simple compilation
+                cmake_config_path = None
+            else:
+                # Original compilation logic for ldp and other tools
+                # Get dependency paths using pkg-config (NixOS style)
+                try:
+                    log4cplus_dir = self._get_pkg_config_path("log4cplus")
+                    apr_dir = self._get_pkg_config_path("apr-1")
+                    cunit_dir = self._get_pkg_config_path("cunit")
+                    logger.info(f"Using pkg-config paths: log4cplus={log4cplus_dir}, apr={apr_dir}, cunit={cunit_dir}")
+                except FileNotFoundError as e:
+                    logger.warning(f"Failed to get pkg-config paths: {e}")
+                    raise
+
+                # Find cmake_config.cmake path (check project dir first, then ecoa-tools root)
+                cmake_config_path = os.path.join(cmake_dir, "cmake_config.cmake")
                 if not os.path.exists(cmake_config_path):
-                    logger.warning(f"cmake_config.cmake not found, will skip -C parameter")
-                    cmake_config_path = None
+                    # Try ecoa-tools root directory (assuming project is under projects_base_dir)
+                    ecoa_tools_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+                    cmake_config_path = os.path.join(ecoa_tools_root, "cmake_config.cmake")
+                    if not os.path.exists(cmake_config_path):
+                        logger.warning(f"cmake_config.cmake not found, will skip -C parameter")
+                        cmake_config_path = None
 
-            # Build CMake command with paths
-            cmake_cmd = [
-                "cmake",
-                "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",
-                f"-DAPR_DIR={apr_dir}",
-                f"-DLOG4CPLUS_DIR={log4cplus_dir}",
-                f"-DCUNIT_DIR={cunit_dir}",
-                f"-DLDP_LOG_USE={log_library}",
-                "-B", build_dir,
-                "-S", cmake_dir
-            ]
+                # Build CMake command with paths
+                cmake_cmd = [
+                    "cmake",
+                    "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",
+                    f"-DAPR_DIR={apr_dir}",
+                    f"-DLOG4CPLUS_DIR={log4cplus_dir}",
+                    f"-DCUNIT_DIR={cunit_dir}",
+                    f"-DLDP_LOG_USE={log_library}",
+                    "-B", build_dir,
+                    "-S", cmake_dir
+                ]
 
-            # Add cmake_config.cmake if found
-            if cmake_config_path:
-                cmake_cmd.extend(["-C", cmake_config_path])
+                # Add cmake_config.cmake if found
+                if cmake_config_path:
+                    cmake_cmd.extend(["-C", cmake_config_path])
 
-            # Add any additional cmake options
-            if cmake_options or default_cmake_options:
-                for opt in (cmake_options or default_cmake_options):
-                    cmake_cmd.append(opt.replace("${log_library}", log_library))
+                # Add any additional cmake options
+                if cmake_options or default_cmake_options:
+                    for opt in (cmake_options or default_cmake_options):
+                        cmake_cmd.append(opt.replace("${log_library}", log_library))
 
-            # Build make command
-            make_cmd = ["make"]
-            make_cmd.extend(default_make_options)
+                # Build make command
+                make_cmd = ["make"]
+                make_cmd.extend(default_make_options)
 
-            # Execute CMake (using -B/-S, so run from cmake_dir)
+            # Execute CMake
             logger.info(f"Running CMake: {' '.join(cmake_cmd)}")
-            cmake_result = subprocess.run(
-                cmake_cmd,
-                cwd=cmake_dir,  # Run from cmake_dir when using -B/-S
-                capture_output=True,
-                text=True,
-                timeout=timeout
-            )
+
+            if tool_id == "csmgvt":
+                # For csmgvt, run cmake from build directory with ".." argument
+                cmake_result = subprocess.run(
+                    cmake_cmd,
+                    cwd=build_dir,  # Run from build directory
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout
+                )
+            else:
+                # For ldp and other tools, run cmake from cmake_dir with -B/-S options
+                cmake_result = subprocess.run(
+                    cmake_cmd,
+                    cwd=cmake_dir,  # Run from cmake_dir when using -B/-S
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout
+                )
 
             cmake_success = cmake_result.returncode == 0
 
@@ -607,12 +639,12 @@ class ToolExecutor:
                 generated_files = self._find_output_files(project_path, output_types)
                 logger.info(f"Found {len(generated_files)} generated files")
 
-            # Compile project if tool is ldp and compilation is enabled
+            # Compile project if tool is ldp or csmgvt and compilation is enabled
             compile_result = {}
-            if success and tool_id == 'ldp':
+            if success and tool_id in ['ldp', 'csmgvt']:
                 # Get compile configuration
-                ldp_config = self.config.get_tool('ldp')
-                compile_config = ldp_config.get('compile', {}) if ldp_config else {}
+                tool_config_for_compile = self.config.get_tool(tool_id)
+                compile_config = tool_config_for_compile.get('compile', {}) if tool_config_for_compile else {}
 
                 # Determine if compilation should be performed
                 should_compile = False
@@ -640,7 +672,8 @@ class ToolExecutor:
                         project_path=project_path,
                         log_library=log_library,
                         cmake_options=cmake_options,
-                        timeout=timeout
+                        timeout=timeout,
+                        tool_id=tool_id
                     )
                     logger.info(f"Compilation {'succeeded' if compile_result.get('compile_success') else 'failed'}")
                 else:
