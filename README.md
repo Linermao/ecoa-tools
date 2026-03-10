@@ -56,10 +56,12 @@ mkdir -p ../workspace
 
 # 3. Run container in background, mounting the shared workspace
 # (On Linux/Mac)
+# Note: Replace <sirius-web-host> with the IP/domain of the sirius-web Java backend.
 docker run -d \
   -p 5000:5000 \
   -v "$(pwd)/../workspace:/workspace" \
   -e ECOA_PROJECTS_BASE_DIR=/workspace \
+  -e SIRIUS_WEB_URL=http://<sirius-web-host>:8080 \
   --name ecoa-tools-service \
   ecoa-tools:latest
 
@@ -68,11 +70,12 @@ docker run -d `
   -p 5000:5000 `
   -v "$((Resolve-Path "..\workspace").Path):/workspace" `
   -e ECOA_PROJECTS_BASE_DIR=/workspace `
+  -e SIRIUS_WEB_URL=http://host.docker.internal:8080 `
   --name ecoa-tools-service `
   ecoa-tools:latest
 
 # debug
-docker run -it -p 5000:5000 -v "$(pwd)/../workspace:/workspace" -e ECOA_PROJECTS_BASE_DIR=/workspace ecoa-tools /bin/bash
+docker run -it -p 5000:5000 -v "$(pwd)/../workspace:/workspace" -e ECOA_PROJECTS_BASE_DIR=/workspace -e SIRIUS_WEB_URL=http://<sirius-web-host>:8080 ecoa-tools /bin/bash
 ```
 
 **Configure `config.yaml` before starting:**

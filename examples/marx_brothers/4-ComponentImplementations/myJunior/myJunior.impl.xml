@@ -1,4 +1,4 @@
-<componentImplementation xmlns="http://www.ecoa.technology/implementation-2.0" componentDefinition="Elder">
+<componentImplementation xmlns="http://www.ecoa.technology/implementation-2.0" componentDefinition="Junior">
 
   <!-- list of used libraries -->
   <use library="libmarx"/>
