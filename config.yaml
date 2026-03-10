@@ -50,6 +50,12 @@ tools:
         description: "External tool that checks ECOA XML validity (e.g., ecoa-exvt)"
         flag: "-k"
         default: "ecoa-exvt"
+      - name: force
+        type: boolean
+        required: false
+        description: "Force overwrite existing directories"
+        flag: "-f"
+        default: true
     output_types:
       - ".h"
       - ".c"
@@ -81,6 +87,12 @@ tools:
         description: "External tool that checks ECOA XML validity (e.g., ecoa-exvt)"
         flag: "-k"
         default: "ecoa-exvt"
+      - name: force
+        type: boolean
+        required: false
+        description: "Force overwrite existing directories"
+        flag: "-f"
+        default: true
     output_types:
       - ".h"
       - ".c"
@@ -112,6 +124,12 @@ tools:
         description: "External tool that checks ECOA XML validity (e.g., ecoa-exvt)"
         flag: "-k"
         default: "ecoa-exvt"
+      - name: force
+        type: boolean
+        required: false
+        description: "Force overwrite existing directories"
+        flag: "-f"
+        default: true
     output_types:
       - ".h"
       - ".c"
@@ -138,6 +156,12 @@ tools:
         description: "Path to the ECOA XML Validation Tool (e.g., ecoa-exvt)"
         flag: "-k"
         default: "ecoa-exvt"
+      - name: force
+        type: boolean
+        required: false
+        description: "Force overwrite existing directories"
+        flag: "-f"
+        default: true
     output_types:
       - ".h"
       - ".c"

@@ -62,12 +62,14 @@ def _send_callback(callback_url: str, payload: dict, task_id: str) -> None:
         logger.error(f"[CB ERROR] task={task_id}: {exc}")
 
 
-def _export_to_disk(project_id: str) -> tuple[bool, str, str, str]:
+def _export_to_disk(project_id: str, workspace_id: Optional[str] = None) -> tuple[bool, str, str, str]:
     """
     Ask the Java backend to export ECOA XML into the shared workspace.
     Returns (success, projectName, projectFile, errorMsg).
     """
     url = f"{SIRIUS_WEB_URL}/api/edt/ecoa/export-to-disk/{project_id}"
+    if workspace_id:
+        url += f"?workspaceId={workspace_id}"
     try:
         resp = requests.post(url, timeout=60)
         if resp.status_code == 200:
@@ -78,11 +80,11 @@ def _export_to_disk(project_id: str) -> tuple[bool, str, str, str]:
         return False, "", "", f"Connection error: {exc}"
 
 
-def _find_config_file(project_id: str, project_name: str) -> Optional[str]:
+def _find_config_file(project_id: str, workspace_id: str, project_name: str) -> Optional[str]:
     """Locate an ASCTG config XML inside the project Steps directory."""
-    steps_dir = WORKSPACE_ROOT / project_id / project_name / "Steps"
+    steps_dir = WORKSPACE_ROOT / project_id / workspace_id / project_name / "Steps"
     if not steps_dir.exists():
-        steps_dir = WORKSPACE_ROOT / project_id / "Steps"
+        steps_dir = WORKSPACE_ROOT / project_id / workspace_id / "Steps"
     for pattern in ["*.config.xml", "*config*.xml"]:
         matches = list(steps_dir.rglob(pattern))
         if matches:
@@ -96,6 +98,7 @@ def _find_config_file(project_id: str, project_name: str) -> Optional[str]:
 def _run_pipeline(
     task_id: str,
     project_id: str,
+    workspace_id: str,
     output_dir: str,
     callback_url: str,
     selected_phases: list[str],
@@ -115,7 +118,7 @@ def _run_pipeline(
         "logs": ["[ECOA-WEB] 正在将 EDT 模型导出为 ECOA XML 文件..."],
     }, task_id)
 
-    export_ok, project_name, project_file, export_err = _export_to_disk(project_id)
+    export_ok, project_name, project_file, export_err = _export_to_disk(project_id, workspace_id)
 
     if not export_ok:
         _send_callback(callback_url, {
@@ -129,8 +132,8 @@ def _run_pipeline(
         }, task_id)
         return
 
-    # Java exported structure: /workspace/{project_id}/{project_name}/Steps
-    tool_cwd = f"{project_id}/{project_name}/Steps"
+    # Java exported structure: /workspace/{project_id}/{workspace_id}/{project_name}/Steps
+    tool_cwd = f"{project_id}/{workspace_id}/{project_name}/Steps"
 
     _send_callback(callback_url, {
         "status": "GENERATING",
@@ -173,7 +176,7 @@ def _run_pipeline(
         # Handle asctg config file
         config_file = None
         if needs_cfg and tool_id == "asctg":
-            config_file = _find_config_file(project_id, project_name)
+            config_file = _find_config_file(project_id, workspace_id, project_name)
             if not config_file:
                 mid = p_start + (p_end - p_start) // 2
                 _send_callback(callback_url, {
@@ -315,24 +318,26 @@ def trigger_generation():
         }
     """
     data = request.get_json(force=True, silent=True) or {}
+    logger.info(f"[API] Received data: {data}")
 
-    task_id     = data.get("taskId")
-    project_id  = data.get("projectId")
-    output_dir  = data.get("outputDir", "/workspace")
-    callback_url = data.get("callbackUrl")
+    task_id     = data.get("taskId") or data.get("task_id")
+    project_id  = data.get("projectId") or data.get("project_id")
+    workspace_id = data.get("workspaceId") or data.get("workspace_id")
+    output_dir  = data.get("outputDir") or data.get("output_dir", "/workspace")
+    callback_url = data.get("callbackUrl") or data.get("callback_url")
     selected_phases = data.get("selectedPhases", ["EXVT", "ASCTG", "MSCIGT", "CSMGVT", "LDP"])
     continue_on_error = bool(data.get("continueOnError", False))
     phase_params = data.get("phaseParams", {})
 
-    if not task_id or not project_id or not callback_url:
-        return jsonify({"success": False, "error": "taskId, projectId and callbackUrl are required"}), 400
+    if not task_id or not project_id or not workspace_id or not callback_url:
+        return jsonify({"success": False, "error": "taskId, projectId, workspaceId and callbackUrl are required"}), 400
 
-    logger.info(f"[API] Generate accepted: task={task_id}, project={project_id}, "
+    logger.info(f"[API] Generate accepted: task={task_id}, project={project_id}, workspace={workspace_id}, "
                 f"phases={selected_phases}, continueOnError={continue_on_error}, params={phase_params}")
 
     t = threading.Thread(
         target=_run_pipeline,
-        args=(task_id, project_id, output_dir, callback_url, selected_phases, continue_on_error, phase_params),
+        args=(task_id, project_id, workspace_id, output_dir, callback_url, selected_phases, continue_on_error, phase_params),
         daemon=True,
     )
     t.start()
