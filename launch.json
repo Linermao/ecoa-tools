@@ -1,0 +1,19 @@
+// 
+// NOTE: This launch.json is for reference only, not for executing the project build.
+//       Python Server API uses the make commands defined here as reference.
+//
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug Platform",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/6-Output/build/bin/platform",
+      "cwd": "${workspaceFolder}/6-Output/build/bin",
+      "args": [],
+      "stopAtEntry": true,
+      "MIMode": "gdb"
+    }
+  ]
+}

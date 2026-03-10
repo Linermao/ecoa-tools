@@ -184,7 +184,8 @@ def execute_in_project():
             "verbose": 3,
             "compile": false,
             "log_library": "log4cplus",
-            "cmake_options": ["-DLDP_LOG_USE=log4cplus"]
+            "cmake_options": ["-DLDP_LOG_USE=log4cplus"],
+            "force": true
         }
 
     Parameters:
@@ -197,6 +198,7 @@ def execute_in_project():
         - compile (optional): Whether to compile project after tool execution (for ldp tool only, default: false)
         - log_library (optional): Logging library for compilation (log4cplus, zlog, lttng, default: log4cplus)
         - cmake_options (optional): Additional CMake options for compilation (array of strings)
+        - force (optional): Force overwrite existing files (for ldp, csmgvt, mscigt tools, default: false)
 
     Returns:
         JSON response with execution result:
@@ -240,6 +242,14 @@ def execute_in_project():
         compile_param = data.get('compile')  # None if not provided
         log_library = data.get('log_library')
         cmake_options = data.get('cmake_options')
+        force_param = data.get('force', False)  # Force overwrite existing files
+
+        # Convert force parameter to boolean if provided
+        if force_param is not None:
+            if isinstance(force_param, str):
+                force_param = force_param.lower() in ('true', '1', 'yes')
+            else:
+                force_param = bool(force_param)
 
         # Validate log_library if provided
         valid_log_libraries = ["log4cplus", "zlog", "lttng"]
@@ -274,7 +284,7 @@ def execute_in_project():
             ctx.warning("Missing project_file")
             raise BadRequest("Missing required parameter: project_file")
 
-        ctx.info(f"Project: {project_name}, File: {project_file}, Tool: {tool_id}, Checker: {checker or 'default'}, Config: {config_file or 'N/A'}, Compile: {compile_param}, LogLibrary: {log_library or 'default'}, CMakeOptions: {len(cmake_options) if cmake_options else 0}")
+        ctx.info(f"Project: {project_name}, File: {project_file}, Tool: {tool_id}, Checker: {checker or 'default'}, Config: {config_file or 'N/A'}, Compile: {compile_param}, LogLibrary: {log_library or 'default'}, CMakeOptions: {len(cmake_options) if cmake_options else 0}, Force: {force_param}")
 
         # Warn if compile is requested for non-ldp/csmgvt tools
         if compile_param and tool_id not in ['ldp', 'csmgvt']:
@@ -295,7 +305,7 @@ def execute_in_project():
         try:
             result = executor.execute_in_project(
                 tool_id, project_name, project_file, verbose, checker, config_file,
-                compile=compile_param, log_library=log_library, cmake_options=cmake_options
+                compile=compile_param, log_library=log_library, cmake_options=cmake_options, force=force_param
             )
 
             if result['success']:

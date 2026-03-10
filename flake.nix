@@ -19,6 +19,7 @@
           lxml
           xsdata
           jinja2
+          requests
 
           # Development tools
           setuptools

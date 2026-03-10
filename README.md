@@ -149,6 +149,7 @@ Content-Type: application/json
 | `verbose`       | integer | No       | `3`                 | Verbosity level (0-4)                                                                                                                                       |
 | `checker`       | string  | No       | `ecoa-exvt`         | Checker tool for validation                                                                                                                                 |
 | `config_file`   | string  | No       | -                   | Config file name (required for `asctg` tool)                                                                                                                |
+| `force`         | boolean | No       | `false`             | Force overwrite existing files (applies to `ldp`, `csmgvt`, `mscigt` tools). Adds `-f` flag to the tool command.                                            |
 
 > **Note:** The `compile`, `log_library`, and `cmake_options` parameters only apply to the `ldp` tool. If specified for other tools, they will be ignored.
 >
@@ -241,8 +242,13 @@ curl -X POST http://localhost:5000/api/tools/execute-project \
   -H "Content-Type: application/json" \
   -d '{"project_name": "marx_brothers", "project_file": "marx_brothers.project.xml", "tool": "mscigt"}'
 
-  #csmgvt
-  curl -X POST http://localhost:5000/api/tools/execute-project \
+# Generate module skeletons (force)
+curl -X POST http://localhost:5000/api/tools/execute-project \
+  -H "Content-Type: application/json" \
+  -d '{"project_name": "marx_brothers", "project_file": "marx_brothers.project.xml", "tool": "mscigt", "force": "true"}'
+
+#csmgvt
+curl -X POST http://localhost:5000/api/tools/execute-project \
   -H "Content-Type: application/json" \
   -d '{"project_name": "marx_brothers", "project_file": "marx_brothers.project.xml", "tool": "csmgvt"}'
 
@@ -250,6 +256,4 @@ curl -X POST http://localhost:5000/api/tools/execute-project \
 curl -X POST http://localhost:5000/api/tools/execute-project \
   -H "Content-Type: application/json" \
   -d '{"project_name": "marx_brothers", "project_file": "marx_brothers.project.xml", "tool": "ldp"}'
-
-
 ```

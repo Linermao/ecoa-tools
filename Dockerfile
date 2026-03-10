@@ -20,6 +20,7 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     gcc \
     g++ \
+    gdb \
     cmake \
     make \
     bison \
@@ -31,7 +32,6 @@ RUN apt-get update && apt-get install -y \
     libxml2-dev \
     libxslt1-dev \
     pkg-config \
-    git \
     ca-certificates \
     curl \
     && apt-get clean \
