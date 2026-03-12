@@ -39,12 +39,16 @@ logger.info(f"[Generator] workspace:  {WORKSPACE_ROOT}")
 # Per-step definitions
 # ---------------------------------------------------------------------------
 #  Each step:  phaseId, toolId, subStatus label, progressStart, progressEnd, requiresConfigFile
+# Correct ECOA toolchain order per AS6 spec:
+# EXVT (validate) → ASCTG (test harness) → MSCIGT (skeleton)
+# → [user writes business logic in Code Server]
+# → Branch A: CSMGVT (functional/non-realtime) OR Branch B: LDP (realtime integration)
 PHASE_STEPS = [
-    dict(phaseId="EXVT",   toolId="exvt",   subStatus="RUNNING_EXVT",    label="[EXVT] XML Validation",      pStart=0,  pEnd=20,  needsCfg=False),
-    dict(phaseId="MSCIGT", toolId="mscigt", subStatus="RUNNING_MSCIGT",  label="[MSCIGT] Skeleton Generator", pStart=20, pEnd=40,  needsCfg=False),
-    dict(phaseId="ASCTG",  toolId="asctg",  subStatus="RUNNING_ASCTG",   label="[ASCTG] Test Generator",     pStart=40, pEnd=60,  needsCfg=True),
-    dict(phaseId="CSMGVT", toolId="csmgvt", subStatus="RUNNING_CSMGVT",  label="[CSMGVT] Cork/Stub Gen",     pStart=60, pEnd=80,  needsCfg=False),
-    dict(phaseId="LDP",    toolId="ldp",    subStatus="RUNNING_LDP",     label="[LDP] Middleware Builder",   pStart=80, pEnd=100, needsCfg=False),
+    dict(phaseId="EXVT",   toolId="exvt",   subStatus="RUNNING_EXVT",    label="[EXVT] XML Validation",      pStart=0,  pEnd=20,  needsCfg=False, awaitCode=False),
+    dict(phaseId="ASCTG",  toolId="asctg",  subStatus="RUNNING_ASCTG",   label="[ASCTG] Test Generator",     pStart=20, pEnd=45,  needsCfg=True,  awaitCode=False),
+    dict(phaseId="MSCIGT", toolId="mscigt", subStatus="RUNNING_MSCIGT",  label="[MSCIGT] Skeleton Generator", pStart=45, pEnd=65,  needsCfg=False, awaitCode=True),
+    dict(phaseId="CSMGVT", toolId="csmgvt", subStatus="RUNNING_CSMGVT",  label="[CSMGVT] Cork/Stub Gen",     pStart=65, pEnd=85,  needsCfg=False, awaitCode=False),
+    dict(phaseId="LDP",    toolId="ldp",    subStatus="RUNNING_LDP",     label="[LDP] Middleware Builder",   pStart=85, pEnd=100, needsCfg=False, awaitCode=False),
 ]
 
 
@@ -154,6 +158,7 @@ def _run_pipeline(
         p_start    = step["pStart"]
         p_end      = step["pEnd"]
         needs_cfg  = step["needsCfg"]
+        await_code = step.get("awaitCode", False)
 
         if phase_id not in selected_phases:
             _send_callback(callback_url, {
@@ -253,6 +258,27 @@ def _run_pipeline(
                 "progress": p_end,
                 "logs": [f"{label} ✓ 执行成功"],
             }, task_id)
+
+            # After MSCIGT: if no execution phase (CSMGVT/LDP) is selected,
+            # pause here with AWAITING_CODE so user can write business logic in Code Server.
+            if await_code:
+                execution_phases = {"CSMGVT", "LDP"}
+                has_next_execution = bool(execution_phases & set(selected_phases))
+                if not has_next_execution:
+                    logger.info(f"[Pipeline] MSCIGT done, no execution phase selected → sending AWAITING_CODE")
+                    _send_callback(callback_url, {
+                        "status": "AWAITING_CODE",
+                        "subStatus": "NONE",
+                        "progress": p_end,
+                        "outputPath": output_path,
+                        "logs": [
+                            f"[MSCIGT] ✓ 代码骨架已生成至: {output_path}",
+                            "[ECOA-WEB] ⏸ 请在 Code Server 中填写模块业务逻辑代码",
+                            "[ECOA-WEB]   完成后，请重新运行并选择执行分支（分支A: CSMGVT 或 分支B: LDP）",
+                        ],
+                    }, task_id)
+                    logger.info(f"[Pipeline] AWAITING_CODE sent, stopping pipeline (task={task_id})")
+                    return
         else:
             had_failure = True
             rc = result.get("return_code", -1)
