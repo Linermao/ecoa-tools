@@ -20,6 +20,7 @@ from typing import Optional
 import requests
 from flask import Blueprint, jsonify, request
 
+from app.services.asctg_service import execute_asctg_from_steps_dir
 from app.services.executor import ToolExecutor
 from app.utils.logger import setup_logger
 
@@ -60,6 +61,12 @@ def _send_callback(callback_url: str, payload: dict, task_id: str) -> None:
                      f"progress={payload.get('progress')}% → HTTP {resp.status_code}")
     except Exception as exc:
         logger.error(f"[CB ERROR] task={task_id}: {exc}")
+
+
+def _send_callback_if_present(callback_url: Optional[str], payload: dict, task_id: str) -> None:
+    """Send callback only when callback URL is provided."""
+    if callback_url:
+        _send_callback(callback_url, payload, task_id)
 
 
 def _export_to_disk(project_id: str) -> tuple[bool, str, str, str]:
@@ -293,6 +300,65 @@ def _run_pipeline(
     }, task_id)
 
 
+def _run_generate_harness_task(
+    task_id: str,
+    project_id: str,
+    steps_dir: str,
+    selected_components: list[str],
+    callback_url: Optional[str] = None,
+) -> None:
+    """Background ASCTG generate_harness task."""
+    _send_callback_if_present(
+        callback_url,
+        {
+            "status": "RUNNING",
+            "progress": 10,
+            "logs": "ASCTG task started",
+        },
+        task_id,
+    )
+
+    result = execute_asctg_from_steps_dir(
+        project_id=project_id,
+        steps_dir=steps_dir,
+        selected_components=selected_components,
+    )
+
+    if result.get("success"):
+        _send_callback_if_present(
+            callback_url,
+            {
+                "status": "SUCCESS",
+                "progress": 100,
+                "logs": "ASCTG task completed",
+            },
+            task_id,
+        )
+        logger.info(
+            "[ASCTG TASK] success task=%s project=%s workspace=%s",
+            task_id,
+            project_id,
+            result.get("workspace_root", ""),
+        )
+        return
+
+    _send_callback_if_present(
+        callback_url,
+        {
+            "status": "FAILED",
+            "progress": 100,
+            "logs": f"ASCTG task failed: {result.get('error', 'unknown error')}",
+        },
+        task_id,
+    )
+    logger.error(
+        "[ASCTG TASK] failed task=%s project=%s error=%s",
+        task_id,
+        project_id,
+        result.get("error", "unknown error"),
+    )
+
+
 # ---------------------------------------------------------------------------
 # API Endpoint
 # ---------------------------------------------------------------------------
@@ -316,10 +382,65 @@ def trigger_generation():
     """
     data = request.get_json(force=True, silent=True) or {}
 
-    task_id     = data.get("taskId")
-    project_id  = data.get("projectId")
-    output_dir  = data.get("outputDir", "/workspace")
-    callback_url = data.get("callbackUrl")
+    task_id = data.get("task_id") or data.get("taskId")
+    project_id = data.get("project_id") or data.get("projectId")
+    step_name = data.get("step_name") or data.get("stepName")
+    callback_url = data.get("callback_url") or data.get("callbackUrl")
+
+    # New task-mode ASCTG wrapper:
+    # task_id + project_id + step_name + steps_dir + selected_components (+ callback_url)
+    if step_name == "generate_harness":
+        steps_dir = data.get("steps_dir") or data.get("stepsDir")
+        selected_components = data.get("selected_components") or data.get("selectedComponents")
+        if selected_components is None:
+            selected_components = []
+
+        if not task_id or not project_id or not steps_dir:
+            return jsonify(
+                {
+                    "success": False,
+                    "error": "task_id, project_id and steps_dir are required for generate_harness",
+                }
+            ), 400
+
+        if not isinstance(selected_components, list) or not all(
+            isinstance(component, str) for component in selected_components
+        ):
+            return jsonify(
+                {
+                    "success": False,
+                    "error": "selected_components must be a list of strings",
+                }
+            ), 400
+
+        logger.info(
+            "[API] Generate harness accepted: task=%s project=%s steps=%s comps=%s",
+            task_id,
+            project_id,
+            steps_dir,
+            len(selected_components),
+        )
+
+        t = threading.Thread(
+            target=_run_generate_harness_task,
+            args=(task_id, project_id, steps_dir, selected_components, callback_url),
+            daemon=True,
+        )
+        t.start()
+        return (
+            jsonify(
+                {
+                    "success": True,
+                    "message": "Accepted",
+                    "task_id": task_id,
+                    "project_id": project_id,
+                    "step_name": step_name,
+                }
+            ),
+            202,
+        )
+
+    output_dir = data.get("outputDir", "/workspace")
     selected_phases = data.get("selectedPhases", ["EXVT", "ASCTG", "MSCIGT", "CSMGVT", "LDP"])
     continue_on_error = bool(data.get("continueOnError", False))
     phase_params = data.get("phaseParams", {})

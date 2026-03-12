@@ -6,6 +6,7 @@ from werkzeug.exceptions import HTTPException
 from app.utils.config import get_config
 from app.utils.logger import setup_logger, get_logger
 from app.routes.tools import bp as tools_bp
+from app.routes.asctg import bp as asctg_bp
 
 
 def create_app(config_path: str = "config.yaml"):
@@ -38,6 +39,7 @@ def create_app(config_path: str = "config.yaml"):
 
     # Register blueprints
     app.register_blueprint(tools_bp)
+    app.register_blueprint(asctg_bp)
     
     from app.routes.generator import bp as generator_bp
     app.register_blueprint(generator_bp)
@@ -53,6 +55,9 @@ def create_app(config_path: str = "config.yaml"):
             'endpoints': {
                 'tools': '/api/tools',
                 'execute': '/api/tools/execute',
+                'asctg_components': '/asctg/components',
+                'asctg_config': '/asctg/config',
+                'asctg_execute': '/asctg/execute',
                 'health': '/health'
             }
         })
