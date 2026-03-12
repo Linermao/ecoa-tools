@@ -3,6 +3,7 @@
 import os
 import subprocess
 import shutil
+import json
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime
@@ -182,6 +183,225 @@ class ToolExecutor:
 
         return sorted(output_files)
 
+    def _create_vscode_launch_config(
+        self,
+        project_path: str,
+        project_name: str,
+        build_dir: str,
+        cmake_dir: str
+    ) -> None:
+        """
+        Create VSCode launch.json configuration for the project.
+
+        Creates .vscode/launch.json in the project directory with debug configuration
+        for the generated executables.
+
+        Args:
+            project_path: Project root directory
+            project_name: Name of the project
+            executable_files: List of executable file names
+            build_dir: Build directory path
+            cmake_dir: CMake directory path (for relative path calculation)
+        """
+
+        # Create .vscode directory
+        vscode_dir = os.path.join(project_path, ".vscode")
+        Path(vscode_dir).mkdir(parents=True, exist_ok=True)
+
+        # Calculate relative path from project_path to executable
+        # cmake_dir is like: project_path/6-Output
+        # build_dir is like: cmake_dir/build
+        # executable is like: build_dir/bin/executable
+
+        # Get relative path from project_path to build_dir
+        try:
+            rel_build_dir = os.path.relpath(build_dir, project_path)
+        except ValueError:
+            # On different drives on Windows, use absolute path
+            rel_build_dir = build_dir
+
+        # Build the program path for VSCode (relative to workspace folder)
+        # ${workspaceFolder} will be replaced by VSCode with the project root
+        program_path = f"${{workspaceFolder}}/{rel_build_dir}/bin/platform"
+
+        # Build cwd path
+        cwd_path = f"${{workspaceFolder}}/{rel_build_dir}/bin"
+
+        launch_json_content = {
+            "version": "0.2.0",
+            "configurations": [
+                {
+                    "name": f"Debug platform",
+                    "type": "cppdbg",
+                    "request": "launch",
+                    "program": program_path,
+                    "cwd": cwd_path,
+                    "args": [],
+                    "stopAtEntry": True,
+                    "MIMode": "gdb",
+                }
+            ]
+        }
+
+        launch_json_path = os.path.join(vscode_dir, "launch.json")
+        with open(launch_json_path, 'w') as f:
+            json.dump(launch_json_content, f, indent=2)
+
+        logger.info(f"Created VSCode launch.json at: {launch_json_path}")
+
+    def _handle_ldp_compilation(
+        self,
+        project_path: str,
+        project_name: str,
+        compile_flag: Optional[bool],
+        log_library: Optional[str],
+        cmake_options: Optional[List[str]]
+    ) -> Dict[str, any]:
+        """
+        Handle compilation logic for LDP tool.
+
+        Args:
+            project_path: Project root directory
+            project_name: Name of the project
+            compile_flag: Whether to compile (True/False/None for auto)
+            log_library: Logging library to use
+            cmake_options: Additional CMake options
+
+        Returns:
+            Compilation result dictionary, or empty dict if compilation was skipped
+        """
+        tool_config = self.config.get_tool("ldp")
+        compile_config = tool_config.get('compile', {}) if tool_config else {}
+
+        # Determine if compilation should be performed
+        should_compile = self._should_compile(compile_flag, compile_config)
+
+        if not should_compile:
+            logger.info(f"Compilation skipped for LDP (compile={compile_flag}, config.enabled={compile_config.get('enabled', False)})")
+            return {}
+
+        # Determine log_library value
+        if log_library is None:
+            log_library = compile_config.get('default_log_library', 'log4cplus')
+
+        # Determine cmake_options
+        if cmake_options is None:
+            cmake_options = compile_config.get('cmake_options', [])
+
+        # Determine timeout
+        timeout = compile_config.get('timeout', 600)
+
+        logger.info(f"Starting LDP compilation with log_library={log_library}")
+        compile_result = self._compile_ldp_project(
+            project_path=project_path,
+            log_library=log_library,
+            cmake_options=cmake_options,
+            timeout=timeout,
+        )
+        logger.info(f"LDP compilation {'succeeded' if compile_result.get('compile_success') else 'failed'}")
+
+        # Create VSCode launch.json if compilation succeeded
+        if compile_result.get('compile_success'):
+            self._create_vscode_launch_config(
+                project_path=project_path,
+                project_name=project_name,
+                build_dir=compile_result.get('build_dir', ''),
+                cmake_dir=compile_result.get('cmake_dir', '')
+            )
+
+        return compile_result
+
+    def _handle_csmgvt_compilation(
+        self,
+        project_path: str,
+        compile_flag: Optional[bool]
+    ) -> Dict[str, any]:
+        """
+        Handle compilation logic for csmgvt tool.
+
+        Args:
+            project_path: Project root directory
+            compile_flag: Whether to compile (True/False/None for auto)
+
+        Returns:
+            Compilation result dictionary, or empty dict if compilation was skipped
+        """
+        tool_config = self.config.get_tool("csmgvt")
+        compile_config = tool_config.get('compile', {}) if tool_config else {}
+
+        # Determine if compilation should be performed
+        should_compile = self._should_compile(compile_flag, compile_config)
+
+        if not should_compile:
+            logger.info(f"Compilation skipped for csmgvt (compile={compile_flag}, config.enabled={compile_config.get('enabled', False)})")
+            return {}
+
+        # Determine timeout
+        timeout = compile_config.get('timeout', 600)
+
+        logger.info("Starting csmgvt compilation")
+        compile_result = self._compile_csmgvt_project(
+            project_path=project_path,
+            timeout=timeout,
+        )
+        logger.info(f"csmgvt compilation {'succeeded' if compile_result.get('compile_success') else 'failed'}")
+        return compile_result
+
+    def _should_compile(self, compile_flag: Optional[bool], compile_config: Dict) -> bool:
+        """
+        Determine if compilation should be performed based on flag and config.
+
+        Args:
+            compile_flag: User-provided compile flag (True/False/None)
+            compile_config: Compilation configuration from tool config
+
+        Returns:
+            True if compilation should be performed, False otherwise
+        """
+        if compile_flag is True:
+            return True
+        elif compile_flag is False:
+            return False
+        else:  # compile_flag is None, use configuration
+            return compile_config.get('enabled', False)
+
+    def _get_message_for_tool(
+        self,
+        return_code: int,
+        tool_id: str,
+        compile_result: Dict[str, any]
+    ) -> str:
+        """
+        Get user-friendly message based on return code and compilation result.
+
+        For LDP/csmgvt:
+            - Tool success + compile success = "executed and compiled successfully"
+            - Tool success + compile failure = "executed successfully but compilation failed"
+            - Tool failure = "execution failed"
+
+        Args:
+            return_code: Tool execution return code
+            tool_id: Tool identifier
+            compile_result: Compilation result dictionary (if any)
+
+        Returns:
+            User-friendly message
+        """
+        if return_code == 0:
+            # Tool executed successfully
+            if compile_result:
+                compile_success = compile_result.get('compile_success', False)
+                if compile_success:
+                    return f'Tool {tool_id} executed and compiled successfully'
+                else:
+                    return f'Tool {tool_id} executed successfully but compilation failed'
+            else:
+                return f'Tool {tool_id} executed successfully'
+        elif return_code < 0:
+            return f'Tool {tool_id} execution failed'
+        else:
+            return f'Tool {tool_id} execution failed with code {return_code}'
+
     def _get_message(self, return_code: int, tool_id: str) -> str:
         """Get user-friendly message based on return code."""
         if return_code == 0:
@@ -230,17 +450,49 @@ class ToolExecutor:
 
     def _get_pkg_config_path(self, package: str) -> str:
         """
-        Get package installation path using pkg-config.
+        Get package installation path using pkg-config with fallback methods.
+
+        Tries multiple methods in order:
+        1. Parse include path from --cflags (most reliable, works on Ubuntu)
+        2. Fall back to --variable=prefix
+        3. Return common system paths if pkg-config fails
 
         Args:
             package: Package name (e.g., 'log4cplus', 'apr-1', 'cunit')
 
         Returns:
-            Installation path from pkg-config
+            Installation path (returns '/usr' if package is installed but path not found)
 
         Raises:
-            FileNotFoundError: If pkg-config or package is not found
+            FileNotFoundError: If pkg-config is not found or package is not installed
         """
+        # Check if pkg-config exists
+        if not shutil.which("pkg-config"):
+            raise FileNotFoundError("pkg-config not found. Please install pkg-config.")
+
+        # Method 1: Parse from --cflags (most reliable on Ubuntu)
+        try:
+            result = subprocess.run(
+                ["pkg-config", "--cflags", package],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            cflags = result.stdout.strip()
+            # Parse -I flags to get include paths
+            for part in cflags.split():
+                if part.startswith("-I"):
+                    path = part[2:]  # Remove -I prefix
+                    # Remove trailing /include or /include/apr-1 etc.
+                    if "/include" in path:
+                        path = path.split("/include")[0]
+                        if path:
+                            logger.debug(f"Found {package} path from cflags: {path}")
+                            return path
+        except subprocess.CalledProcessError:
+            logger.debug(f"pkg-config --cflags failed for {package}")
+
+        # Method 2: Try --variable=prefix (original method)
         try:
             result = subprocess.run(
                 ["pkg-config", "--variable=prefix", package],
@@ -667,29 +919,15 @@ class ToolExecutor:
         logger.debug(f"Command: {' '.join(cmd)}")
         logger.debug(f"Working directory: {project_path}")
 
-        # Execute tool in a temporary symlink directory to avoid spaces in paths
-        # generated by standard exporters breaking ecoa-ldp/ecoa-exvt inner tools
-        import uuid
-        import shutil
-        safe_symlink_name = f"tmp_workspace_{uuid.uuid4().hex[:8]}"
-        safe_symlink_path = os.path.join(self.config.projects_base_dir, safe_symlink_name)
-        
+        # Execute tool in project directory
         try:
-            # We use a wrapper folder or symlink approach. But for Windows/Linux
-            # cross-compatibility inside container, symlink is best for Unix.
-            os.symlink(project_path, safe_symlink_path)
-            
-            try:
-                result = subprocess.run(
-                    cmd,
-                    cwd=safe_symlink_path,
-                    capture_output=True,
-                    text=True,
-                    timeout=300  # 5 minute timeout
-                )
-            finally:
-                if os.path.islink(safe_symlink_path) or os.path.exists(safe_symlink_path):
-                    os.unlink(safe_symlink_path)
+            result = subprocess.run(
+                cmd,
+                cwd=project_path,
+                capture_output=True,
+                text=True,
+                timeout=300  # 5 minute timeout
+            )
 
             success = result.returncode == 0
 

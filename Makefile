@@ -1,11 +1,12 @@
 #
-# Dependencies 
+# NOTE: This Makefile is for reference only, not for executing the project build.
+#       Python Server API uses the make commands defined here as reference.
 #
 
-LOG4CPLUS_DIR=$(shell pkg-config --variable=prefix log4cplus)
-APR_DIR=$(shell pkg-config --variable=prefix apr-1)
+LOG4CPLUS_DIR=/usr
+APR_DIR=/usr
 # ZLOG_DIR=$(shell pkg-config --variable=prefix zlog)
-CUNIT_DIR=$(shell pkg-config --variable=prefix cunit)
+CUNIT_DIR=/usr
 
 APPS_DIR=./examples
 OUTPUT_DIR=app.rootfs

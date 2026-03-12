@@ -39,16 +39,12 @@ logger.info(f"[Generator] workspace:  {WORKSPACE_ROOT}")
 # Per-step definitions
 # ---------------------------------------------------------------------------
 #  Each step:  phaseId, toolId, subStatus label, progressStart, progressEnd, requiresConfigFile
-# Correct ECOA toolchain order per AS6 spec:
-# EXVT (validate) → ASCTG (test harness) → MSCIGT (skeleton)
-# → [user writes business logic in Code Server]
-# → Branch A: CSMGVT (functional/non-realtime) OR Branch B: LDP (realtime integration)
 PHASE_STEPS = [
-    dict(phaseId="EXVT",   toolId="exvt",   subStatus="RUNNING_EXVT",    label="[EXVT] XML Validation",      pStart=0,  pEnd=20,  needsCfg=False, awaitCode=False),
-    dict(phaseId="ASCTG",  toolId="asctg",  subStatus="RUNNING_ASCTG",   label="[ASCTG] Test Generator",     pStart=20, pEnd=45,  needsCfg=True,  awaitCode=False),
-    dict(phaseId="MSCIGT", toolId="mscigt", subStatus="RUNNING_MSCIGT",  label="[MSCIGT] Skeleton Generator", pStart=45, pEnd=65,  needsCfg=False, awaitCode=True),
-    dict(phaseId="CSMGVT", toolId="csmgvt", subStatus="RUNNING_CSMGVT",  label="[CSMGVT] Cork/Stub Gen",     pStart=65, pEnd=85,  needsCfg=False, awaitCode=False),
-    dict(phaseId="LDP",    toolId="ldp",    subStatus="RUNNING_LDP",     label="[LDP] Middleware Builder",   pStart=85, pEnd=100, needsCfg=False, awaitCode=False),
+    dict(phaseId="EXVT",   toolId="exvt",   subStatus="RUNNING_EXVT",    label="[EXVT] XML Validation",      pStart=0,  pEnd=20,  needsCfg=False),
+    dict(phaseId="MSCIGT", toolId="mscigt", subStatus="RUNNING_MSCIGT",  label="[MSCIGT] Skeleton Generator", pStart=20, pEnd=40,  needsCfg=False),
+    dict(phaseId="ASCTG",  toolId="asctg",  subStatus="RUNNING_ASCTG",   label="[ASCTG] Test Generator",     pStart=40, pEnd=60,  needsCfg=True),
+    dict(phaseId="CSMGVT", toolId="csmgvt", subStatus="RUNNING_CSMGVT",  label="[CSMGVT] Cork/Stub Gen",     pStart=60, pEnd=80,  needsCfg=False),
+    dict(phaseId="LDP",    toolId="ldp",    subStatus="RUNNING_LDP",     label="[LDP] Middleware Builder",   pStart=80, pEnd=100, needsCfg=False),
 ]
 
 
@@ -66,14 +62,12 @@ def _send_callback(callback_url: str, payload: dict, task_id: str) -> None:
         logger.error(f"[CB ERROR] task={task_id}: {exc}")
 
 
-def _export_to_disk(project_id: str, workspace_id: Optional[str] = None) -> tuple[bool, str, str, str]:
+def _export_to_disk(project_id: str) -> tuple[bool, str, str, str]:
     """
     Ask the Java backend to export ECOA XML into the shared workspace.
     Returns (success, projectName, projectFile, errorMsg).
     """
     url = f"{SIRIUS_WEB_URL}/api/edt/ecoa/export-to-disk/{project_id}"
-    if workspace_id:
-        url += f"?workspaceId={workspace_id}"
     try:
         resp = requests.post(url, timeout=60)
         if resp.status_code == 200:
@@ -84,11 +78,11 @@ def _export_to_disk(project_id: str, workspace_id: Optional[str] = None) -> tupl
         return False, "", "", f"Connection error: {exc}"
 
 
-def _find_config_file(project_id: str, workspace_id: str, project_name: str) -> Optional[str]:
+def _find_config_file(project_id: str, project_name: str) -> Optional[str]:
     """Locate an ASCTG config XML inside the project Steps directory."""
-    steps_dir = WORKSPACE_ROOT / project_id / workspace_id / project_name / "Steps"
+    steps_dir = WORKSPACE_ROOT / project_id / project_name / "Steps"
     if not steps_dir.exists():
-        steps_dir = WORKSPACE_ROOT / project_id / workspace_id / "Steps"
+        steps_dir = WORKSPACE_ROOT / project_id / "Steps"
     for pattern in ["*.config.xml", "*config*.xml"]:
         matches = list(steps_dir.rglob(pattern))
         if matches:
@@ -102,7 +96,6 @@ def _find_config_file(project_id: str, workspace_id: str, project_name: str) -> 
 def _run_pipeline(
     task_id: str,
     project_id: str,
-    workspace_id: str,
     output_dir: str,
     callback_url: str,
     selected_phases: list[str],
@@ -122,7 +115,7 @@ def _run_pipeline(
         "logs": ["[ECOA-WEB] 正在将 EDT 模型导出为 ECOA XML 文件..."],
     }, task_id)
 
-    export_ok, project_name, project_file, export_err = _export_to_disk(project_id, workspace_id)
+    export_ok, project_name, project_file, export_err = _export_to_disk(project_id)
 
     if not export_ok:
         _send_callback(callback_url, {
@@ -136,8 +129,8 @@ def _run_pipeline(
         }, task_id)
         return
 
-    # Java exported structure: /workspace/{project_id}/{workspace_id}/{project_name}/Steps
-    tool_cwd = f"{project_id}/{workspace_id}/{project_name}/Steps"
+    # Java exported structure: /workspace/{project_id}/{project_name}/Steps
+    tool_cwd = f"{project_id}/{project_name}/Steps"
 
     _send_callback(callback_url, {
         "status": "GENERATING",
@@ -158,7 +151,6 @@ def _run_pipeline(
         p_start    = step["pStart"]
         p_end      = step["pEnd"]
         needs_cfg  = step["needsCfg"]
-        await_code = step.get("awaitCode", False)
 
         if phase_id not in selected_phases:
             _send_callback(callback_url, {
@@ -181,7 +173,7 @@ def _run_pipeline(
         # Handle asctg config file
         config_file = None
         if needs_cfg and tool_id == "asctg":
-            config_file = _find_config_file(project_id, workspace_id, project_name)
+            config_file = _find_config_file(project_id, project_name)
             if not config_file:
                 mid = p_start + (p_end - p_start) // 2
                 _send_callback(callback_url, {
@@ -258,27 +250,6 @@ def _run_pipeline(
                 "progress": p_end,
                 "logs": [f"{label} ✓ 执行成功"],
             }, task_id)
-
-            # After MSCIGT: if no execution phase (CSMGVT/LDP) is selected,
-            # pause here with AWAITING_CODE so user can write business logic in Code Server.
-            if await_code:
-                execution_phases = {"CSMGVT", "LDP"}
-                has_next_execution = bool(execution_phases & set(selected_phases))
-                if not has_next_execution:
-                    logger.info(f"[Pipeline] MSCIGT done, no execution phase selected → sending AWAITING_CODE")
-                    _send_callback(callback_url, {
-                        "status": "AWAITING_CODE",
-                        "subStatus": "NONE",
-                        "progress": p_end,
-                        "outputPath": output_path,
-                        "logs": [
-                            f"[MSCIGT] ✓ 代码骨架已生成至: {output_path}",
-                            "[ECOA-WEB] ⏸ 请在 Code Server 中填写模块业务逻辑代码",
-                            "[ECOA-WEB]   完成后，请重新运行并选择执行分支（分支A: CSMGVT 或 分支B: LDP）",
-                        ],
-                    }, task_id)
-                    logger.info(f"[Pipeline] AWAITING_CODE sent, stopping pipeline (task={task_id})")
-                    return
         else:
             had_failure = True
             rc = result.get("return_code", -1)
@@ -322,6 +293,65 @@ def _run_pipeline(
     }, task_id)
 
 
+def _run_generate_harness_task(
+    task_id: str,
+    project_id: str,
+    steps_dir: str,
+    selected_components: list[str],
+    callback_url: Optional[str] = None,
+) -> None:
+    """Background ASCTG generate_harness task."""
+    _send_callback_if_present(
+        callback_url,
+        {
+            "status": "RUNNING",
+            "progress": 10,
+            "logs": "ASCTG task started",
+        },
+        task_id,
+    )
+
+    result = execute_asctg_from_steps_dir(
+        project_id=project_id,
+        steps_dir=steps_dir,
+        selected_components=selected_components,
+    )
+
+    if result.get("success"):
+        _send_callback_if_present(
+            callback_url,
+            {
+                "status": "SUCCESS",
+                "progress": 100,
+                "logs": "ASCTG task completed",
+            },
+            task_id,
+        )
+        logger.info(
+            "[ASCTG TASK] success task=%s project=%s workspace=%s",
+            task_id,
+            project_id,
+            result.get("workspace_root", ""),
+        )
+        return
+
+    _send_callback_if_present(
+        callback_url,
+        {
+            "status": "FAILED",
+            "progress": 100,
+            "logs": f"ASCTG task failed: {result.get('error', 'unknown error')}",
+        },
+        task_id,
+    )
+    logger.error(
+        "[ASCTG TASK] failed task=%s project=%s error=%s",
+        task_id,
+        project_id,
+        result.get("error", "unknown error"),
+    )
+
+
 # ---------------------------------------------------------------------------
 # API Endpoint
 # ---------------------------------------------------------------------------
@@ -344,26 +374,79 @@ def trigger_generation():
         }
     """
     data = request.get_json(force=True, silent=True) or {}
-    logger.info(f"[API] Received data: {data}")
 
-    task_id     = data.get("taskId") or data.get("task_id")
-    project_id  = data.get("projectId") or data.get("project_id")
-    workspace_id = data.get("workspaceId") or data.get("workspace_id")
-    output_dir  = data.get("outputDir") or data.get("output_dir", "/workspace")
-    callback_url = data.get("callbackUrl") or data.get("callback_url")
+    task_id = data.get("task_id") or data.get("taskId")
+    project_id = data.get("project_id") or data.get("projectId")
+    step_name = data.get("step_name") or data.get("stepName")
+    callback_url = data.get("callback_url") or data.get("callbackUrl")
+
+    # New task-mode ASCTG wrapper:
+    # task_id + project_id + step_name + steps_dir + selected_components (+ callback_url)
+    if step_name == "generate_harness":
+        steps_dir = data.get("steps_dir") or data.get("stepsDir")
+        selected_components = data.get("selected_components") or data.get("selectedComponents")
+        if selected_components is None:
+            selected_components = []
+
+        if not task_id or not project_id or not steps_dir:
+            return jsonify(
+                {
+                    "success": False,
+                    "error": "task_id, project_id and steps_dir are required for generate_harness",
+                }
+            ), 400
+
+        if not isinstance(selected_components, list) or not all(
+            isinstance(component, str) for component in selected_components
+        ):
+            return jsonify(
+                {
+                    "success": False,
+                    "error": "selected_components must be a list of strings",
+                }
+            ), 400
+
+        logger.info(
+            "[API] Generate harness accepted: task=%s project=%s steps=%s comps=%s",
+            task_id,
+            project_id,
+            steps_dir,
+            len(selected_components),
+        )
+
+        t = threading.Thread(
+            target=_run_generate_harness_task,
+            args=(task_id, project_id, steps_dir, selected_components, callback_url),
+            daemon=True,
+        )
+        t.start()
+        return (
+            jsonify(
+                {
+                    "success": True,
+                    "message": "Accepted",
+                    "task_id": task_id,
+                    "project_id": project_id,
+                    "step_name": step_name,
+                }
+            ),
+            202,
+        )
+
+    output_dir = data.get("outputDir", "/workspace")
     selected_phases = data.get("selectedPhases", ["EXVT", "ASCTG", "MSCIGT", "CSMGVT", "LDP"])
     continue_on_error = bool(data.get("continueOnError", False))
     phase_params = data.get("phaseParams", {})
 
-    if not task_id or not project_id or not workspace_id or not callback_url:
-        return jsonify({"success": False, "error": "taskId, projectId, workspaceId and callbackUrl are required"}), 400
+    if not task_id or not project_id or not callback_url:
+        return jsonify({"success": False, "error": "taskId, projectId and callbackUrl are required"}), 400
 
-    logger.info(f"[API] Generate accepted: task={task_id}, project={project_id}, workspace={workspace_id}, "
+    logger.info(f"[API] Generate accepted: task={task_id}, project={project_id}, "
                 f"phases={selected_phases}, continueOnError={continue_on_error}, params={phase_params}")
 
     t = threading.Thread(
         target=_run_pipeline,
-        args=(task_id, project_id, workspace_id, output_dir, callback_url, selected_phases, continue_on_error, phase_params),
+        args=(task_id, project_id, output_dir, callback_url, selected_phases, continue_on_error, phase_params),
         daemon=True,
     )
     t.start()
