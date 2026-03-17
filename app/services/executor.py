@@ -188,40 +188,36 @@ class ToolExecutor:
         project_path: str,
         project_name: str,
         build_dir: str,
-        cmake_dir: str
+        cmake_dir: str,
+        workspace_dir: str = None
     ) -> None:
         """
         Create VSCode launch.json configuration for the project.
 
-        Creates .vscode/launch.json in the project directory with debug configuration
-        for the generated executables.
+        Creates .vscode/launch.json in the workspace directory (or project directory if not provided)
+        with debug configuration for the generated executables.
 
         Args:
-            project_path: Project root directory
+            project_path: Project root directory (e.g., /workspace/.../Steps)
             project_name: Name of the project
-            executable_files: List of executable file names
             build_dir: Build directory path
-            cmake_dir: CMake directory path (for relative path calculation)
+            cmake_dir: CMake directory path
+            workspace_dir: Target directory for .vscode (optional)
         """
 
-        # Create .vscode directory
-        vscode_dir = os.path.join(project_path, ".vscode")
+        # Provide a target directory for .vscode (use workspace_dir if provided, else project_path)
+        target_dir = workspace_dir if workspace_dir else project_path
+        vscode_dir = os.path.join(target_dir, ".vscode")
         Path(vscode_dir).mkdir(parents=True, exist_ok=True)
 
-        # Calculate relative path from project_path to executable
-        # cmake_dir is like: project_path/6-Output
-        # build_dir is like: cmake_dir/build
-        # executable is like: build_dir/bin/executable
-
-        # Get relative path from project_path to build_dir
+        # Calculate relative path from target_dir to executable
         try:
-            rel_build_dir = os.path.relpath(build_dir, project_path)
+            rel_build_dir = os.path.relpath(build_dir, target_dir)
         except ValueError:
             # On different drives on Windows, use absolute path
             rel_build_dir = build_dir
 
         # Build the program path for VSCode (relative to workspace folder)
-        # ${workspaceFolder} will be replaced by VSCode with the project root
         program_path = f"${{workspaceFolder}}/{rel_build_dir}/bin/platform"
 
         # Build cwd path
@@ -249,103 +245,7 @@ class ToolExecutor:
 
         logger.info(f"Created VSCode launch.json at: {launch_json_path}")
 
-    def _handle_ldp_compilation(
-        self,
-        project_path: str,
-        project_name: str,
-        compile_flag: Optional[bool],
-        log_library: Optional[str],
-        cmake_options: Optional[List[str]]
-    ) -> Dict[str, any]:
-        """
-        Handle compilation logic for LDP tool.
 
-        Args:
-            project_path: Project root directory
-            project_name: Name of the project
-            compile_flag: Whether to compile (True/False/None for auto)
-            log_library: Logging library to use
-            cmake_options: Additional CMake options
-
-        Returns:
-            Compilation result dictionary, or empty dict if compilation was skipped
-        """
-        tool_config = self.config.get_tool("ldp")
-        compile_config = tool_config.get('compile', {}) if tool_config else {}
-
-        # Determine if compilation should be performed
-        should_compile = self._should_compile(compile_flag, compile_config)
-
-        if not should_compile:
-            logger.info(f"Compilation skipped for LDP (compile={compile_flag}, config.enabled={compile_config.get('enabled', False)})")
-            return {}
-
-        # Determine log_library value
-        if log_library is None:
-            log_library = compile_config.get('default_log_library', 'log4cplus')
-
-        # Determine cmake_options
-        if cmake_options is None:
-            cmake_options = compile_config.get('cmake_options', [])
-
-        # Determine timeout
-        timeout = compile_config.get('timeout', 600)
-
-        logger.info(f"Starting LDP compilation with log_library={log_library}")
-        compile_result = self._compile_ldp_project(
-            project_path=project_path,
-            log_library=log_library,
-            cmake_options=cmake_options,
-            timeout=timeout,
-        )
-        logger.info(f"LDP compilation {'succeeded' if compile_result.get('compile_success') else 'failed'}")
-
-        # Create VSCode launch.json if compilation succeeded
-        if compile_result.get('compile_success'):
-            self._create_vscode_launch_config(
-                project_path=project_path,
-                project_name=project_name,
-                build_dir=compile_result.get('build_dir', ''),
-                cmake_dir=compile_result.get('cmake_dir', '')
-            )
-
-        return compile_result
-
-    def _handle_csmgvt_compilation(
-        self,
-        project_path: str,
-        compile_flag: Optional[bool]
-    ) -> Dict[str, any]:
-        """
-        Handle compilation logic for csmgvt tool.
-
-        Args:
-            project_path: Project root directory
-            compile_flag: Whether to compile (True/False/None for auto)
-
-        Returns:
-            Compilation result dictionary, or empty dict if compilation was skipped
-        """
-        tool_config = self.config.get_tool("csmgvt")
-        compile_config = tool_config.get('compile', {}) if tool_config else {}
-
-        # Determine if compilation should be performed
-        should_compile = self._should_compile(compile_flag, compile_config)
-
-        if not should_compile:
-            logger.info(f"Compilation skipped for csmgvt (compile={compile_flag}, config.enabled={compile_config.get('enabled', False)})")
-            return {}
-
-        # Determine timeout
-        timeout = compile_config.get('timeout', 600)
-
-        logger.info("Starting csmgvt compilation")
-        compile_result = self._compile_csmgvt_project(
-            project_path=project_path,
-            timeout=timeout,
-        )
-        logger.info(f"csmgvt compilation {'succeeded' if compile_result.get('compile_success') else 'failed'}")
-        return compile_result
 
     def _should_compile(self, compile_flag: Optional[bool], compile_config: Dict) -> bool:
         """
@@ -634,6 +534,22 @@ class ToolExecutor:
                 make_cmd = ["make"]
                 make_cmd.extend(default_make_options)
 
+            # Check if compilation already done
+            platform_executable = os.path.join(build_dir, "bin", "platform")
+            if os.path.exists(platform_executable) and os.access(platform_executable, os.X_OK):
+                logger.info(f"Compilation skipped: {platform_executable} already exists")
+                return {
+                    "compile_success": True,
+                    "compile_stdout": f"{platform_executable} already exists. Compilation bypassed.",
+                    "compile_stderr": "",
+                    "compile_return_code": 0,
+                    "executable_files": ["platform"],
+                    "cmake_dir": cmake_dir,
+                    "build_dir": build_dir,
+                    "cmake_command": "",
+                    "make_command": ""
+                }
+
             # Execute CMake
             logger.info(f"Running CMake: {' '.join(cmake_cmd)}")
 
@@ -775,7 +691,8 @@ class ToolExecutor:
         compile: Optional[bool] = None,
         log_library: str = None,
         cmake_options: List[str] = None,
-        additional_args: List[str] = None
+        additional_args: List[str] = None,
+        workspace_dir: str = None,
     ) -> Dict[str, any]:
         """
         Execute a tool in a project directory.
@@ -937,6 +854,21 @@ class ToolExecutor:
                 output_types = tool_config.get('output_types', [])
                 generated_files = self._find_output_files(project_path, output_types)
                 logger.info(f"Found {len(generated_files)} generated files")
+
+                # Always generate VSCode launch.json for LDP on success, regardless of compilation
+                if tool_id == 'ldp':
+                    try:
+                        cmake_dir = self._find_cmakelists_dir(project_path)
+                        build_dir = os.path.join(cmake_dir, "build")
+                        self._create_vscode_launch_config(
+                            project_path=project_path,
+                            project_name=project_name,
+                            build_dir=build_dir,
+                            cmake_dir=cmake_dir,
+                            workspace_dir=workspace_dir
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to create launch.json for LDP: {e}")
 
             # Compile project if tool is ldp or csmgvt and compilation is enabled
             compile_result = {}

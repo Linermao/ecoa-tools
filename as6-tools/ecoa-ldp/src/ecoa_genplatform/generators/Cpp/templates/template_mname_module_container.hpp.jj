@@ -31,9 +31,12 @@ class Container
 	public:
 
 		/* Logging and fault management API */
-	{% for i in ["log_trace","log_debug","log_info","log_warning","raise_error","raise_fatal_error"] %}
+	{% for i in ["log_trace","log_debug","log_info","log_warning"] %}
         void  {{i}} (const ECOA::log &log);
-    {% endfor %}
+	{% endfor %}
+	{% for i in ["raise_error","raise_fatal_error"] %}
+        void  {{i}} (const ECOA::log &log, const ECOA::error_code error_code);
+	{% endfor %}
 
     	/*Time services API */
         void get_relative_local_time(ECOA::hr_time& relative_local_time);
