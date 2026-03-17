@@ -23,6 +23,7 @@ RUN apt-get update && apt-get install -y \
     gdb \
     cmake \
     make \
+    gdb \
     bison \
     flex \
     libapr1-dev \

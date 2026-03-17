@@ -324,32 +324,48 @@ def execute_asctg(
     output_path: Optional[str] = None,
     workspace_base_dir: Optional[str] = None,
     source_project_root: Optional[str] = None,
+    copy_to_workspace: bool = True,
 ) -> dict:
     """
-    End-to-end ASCTG execution on copied workspace project.
+    End-to-end ASCTG execution on project.
 
     Flow:
-      1) Copy source project to unique workspace
-      2) Map source composite path into copied workspace
+      1) (Optional) Copy source project to unique workspace
+      2) Map source composite path into workspace
       3) Generate config under workspace root
-      4) Run ecoa-asctg on copied project
+      4) Run ecoa-asctg on project
     """
     workspace_info: dict = {}
     config_path = ""
 
     try:
-        workspace_info = prepare_project_workspace(
-            project_path,
-            workspace_base_dir=workspace_base_dir,
-            source_project_root=source_project_root,
-        )
-
-        workspace_root = Path(workspace_info["workspace_root"])
-        workspace_project_dir = workspace_info["project_dir"]
+        if copy_to_workspace:
+            workspace_info = prepare_project_workspace(
+                project_path,
+                workspace_base_dir=workspace_base_dir,
+                source_project_root=source_project_root,
+            )
+            workspace_root = Path(workspace_info["workspace_root"])
+            workspace_project_dir = workspace_info["project_dir"]
+            mapped_project_path = workspace_info["project_path"]
+            mapped_source_root = workspace_info["source_project_root"]
+        else:
+            # Use original paths directly
+            workspace_project_root = Path(project_path).resolve().parent
+            workspace_info = {
+                "workspace_root": str(workspace_project_root),
+                "project_dir": str(workspace_project_root),
+                "project_path": project_path,
+                "source_project_root": source_project_root or str(workspace_project_root),
+            }
+            workspace_root = workspace_project_root
+            workspace_project_dir = workspace_info["project_dir"]
+            mapped_project_path = project_path
+            mapped_source_root = workspace_info["source_project_root"]
 
         mapped_composite_path = map_path_to_workspace(
             source_path=composite_path,
-            source_project_root=workspace_info["source_project_root"],
+            source_project_root=mapped_source_root,
             workspace_project_dir=workspace_project_dir,
         )
 
@@ -366,7 +382,7 @@ def execute_asctg(
         )
 
         run_result = run_asctg(
-            project_path=workspace_info["project_path"],
+            project_path=mapped_project_path,
             config_path=generated_config_path,
             force=True,
         )
@@ -374,7 +390,7 @@ def execute_asctg(
         run_result.update(
             {
                 "workspace_root": workspace_info["workspace_root"],
-                "project_path": workspace_info["project_path"],
+                "project_path": mapped_project_path,
                 "config_path": generated_config_path,
                 "composite_path": mapped_composite_path,
             }
@@ -408,6 +424,7 @@ def execute_asctg_from_steps_dir(
         project_path=context["project_path"],
         workspace_base_dir=workspace_base_dir,
         source_project_root=context["source_project_root"],
+        copy_to_workspace=False,
     )
     result.update(
         {
