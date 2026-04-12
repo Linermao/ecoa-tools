@@ -14,7 +14,8 @@ Flask-based REST API for executing ECOA tools on project files. Tools run in pro
 | `csmgvt` | `ecoa-csmgvt` | CSM Generator & Verification Tool                                | testing         |
 | `mscigt` | `ecoa-mscigt` | Module Skeletons & Container Interfaces Generator                | code_generation |
 | `asctg`  | `ecoa-asctg`  | Application Software Components Test Generator                   | testing         |
-| `ldp`    | `ecoa-ldp`    | Lightweight Development Platform (with auto-compilation support) | code_generation |
+| `ldp`    | `ecoa-ldp`    | Lightweight Development Platform code generation                 | code_generation |
+| `make`   | `make`        | Configure and build an LDP-generated project with CMake + make  | build           |
 
 ## Installation
 
@@ -83,24 +84,23 @@ projects_base_dir: "/path/to/your/ecoa-projects"
 
 > **Important:** Set this to where your frontend exports project files.
 
-**LDP Compilation Configuration:**
+**LDP Build Configuration:**
 
-The `ldp` tool supports automatic compilation after code generation. By default, compilation is enabled and uses `log4cplus` logging library. Configure compilation settings in `config.yaml`:
+The `ldp` tool now only generates code. Use the separate `make` tool to run the LDP build (`cmake` + `make`). Configure default build settings in `config.yaml`:
 
 ```yaml
-ldp:
+make:
   # ... existing configuration ...
-  compile:
-    enabled: true # Enable compilation by default
+  build:
     default_log_library: "log4cplus" # Default logging library
-    timeout: 600 # Compilation timeout in seconds
+    timeout: 600 # Build timeout in seconds
     cmake_options: # Default CMake options
       - "-DLDP_LOG_USE=${log_library}"
     make_options: # Default make options
       - "-j"
 ```
 
-Compilation parameters can be overridden via API request. See [Execute Tool in Project](#execute-tool-in-project) for details.
+Build parameters can be overridden via API request. See [Execute Tool in Project](#execute-tool-in-project) for details.
 
 ```bash
 # Start server
@@ -142,32 +142,33 @@ Content-Type: application/json
 | --------------- | ------- | -------- | ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `project_name`  | string  | Yes      | -                   | Project directory name                                                                                                                                      |
 | `project_file`  | string  | Yes      | -                   | Project XML file name                                                                                                                                       |
-| `tool`          | string  | Yes      | `exvt`              | Tool ID to execute (`ldp`, `exvt`, `csmgvt`, `mscigt`, `asctg`)                                                                                             |
-| `compile`       | boolean | No       | `null` (use config) | Whether to compile project after tool execution (for `ldp` tool only). `null`: use config default (enabled), `true`: always compile, `false`: never compile |
-| `log_library`   | string  | No       | `null` (use config) | Logging library for compilation (`log4cplus`, `zlog`, `lttng`). Uses config default if not specified.                                                       |
-| `cmake_options` | array   | No       | `null` (use config) | Additional CMake options for compilation. Uses config default if not specified.                                                                             |
+| `tool`          | string  | Yes      | `exvt`              | Tool ID to execute (`ldp`, `make`, `exvt`, `csmgvt`, `mscigt`, `asctg`)                                                                                     |
+| `compile`       | boolean | No       | `null` (use config) | Whether to compile project after tool execution (for `csmgvt` only). `null`: use config default, `true`: always compile, `false`: never compile           |
+| `log_library`   | string  | No       | `null` (use config) | Logging library for `make` build (`log4cplus`, `zlog`, `lttng`). Uses config default if not specified.                                                     |
+| `cmake_options` | array   | No       | `null` (use config) | Additional CMake options for `make` build. Uses config default if not specified.                                                                            |
+| `make_options`  | array   | No       | `null` (use config) | Additional make options for `make` build. Uses config default if not specified.                                                                             |
 | `verbose`       | integer | No       | `3`                 | Verbosity level (0-4)                                                                                                                                       |
 | `checker`       | string  | No       | `ecoa-exvt`         | Checker tool for validation                                                                                                                                 |
 | `config_file`   | string  | No       | -                   | Config file name (required for `asctg` tool)                                                                                                                |
 | `force`         | boolean | No       | `false`             | Force overwrite existing files (applies to `ldp`, `csmgvt`, `mscigt` tools). Adds `-f` flag to the tool command.                                            |
 
-> **Note:** The `compile`, `log_library`, and `cmake_options` parameters only apply to the `ldp` tool. If specified for other tools, they will be ignored.
+> **Note:** The `compile` parameter only applies to `csmgvt`. The `log_library`, `cmake_options`, and `make_options` parameters apply to `make`.
 >
-> **Default Behavior:** For `ldp` tool, compilation is enabled by default using `log4cplus` logging library. To disable compilation, set `"compile": false` in the API request.
+> **Default Behavior:** `ldp` only generates code. Run `tool: "make"` as the separate build step.
 
-**Response (default compilation enabled):**
+**Response (`tool: "make"`):**
 
 ```json
 {
   "success": true,
-  "tool": "ldp",
+  "tool": "make",
   "project_name": "marx_brothers",
   "project_path": "/path/to/ecoa-projects/marx_brothers",
   "project_file": "marx_brothers.project.xml",
-  "generated_files": ["main.c", "platform.c", "CMakeLists.txt", ...],
-  "message": "Tool ldp executed successfully",
-  "stdout": "...",
-  "stderr": "...",
+  "generated_files": [],
+  "message": "Tool make executed successfully",
+  "stdout": "=== CMake Output ===\n...\n=== Make Output ===\n...",
+  "stderr": "=== CMake Errors ===\n...\n=== Make Errors ===\n...",
   "return_code": 0,
   "compile_success": true,
   "compile_stdout": "=== CMake Output ===\n...\n=== Make Output ===\n...",
@@ -175,11 +176,13 @@ Content-Type: application/json
   "compile_return_code": 0,
   "executable_files": ["app1", "app2"],
   "cmake_dir": "/path/to/ecoa-projects/marx_brothers/6-output",
-  "build_dir": "/path/to/ecoa-projects/marx_brothers/6-output/build"
+  "build_dir": "/path/to/ecoa-projects/marx_brothers/6-output/build",
+  "cmake_command": "cmake ...",
+  "make_command": "make ..."
 }
 ```
 
-**Response (with compilation disabled `compile: false`):**
+**Response (`tool: "ldp"` default behavior):**
 
 ```json
 {
@@ -247,13 +250,18 @@ curl -X POST http://localhost:5000/api/tools/execute-project \
   -H "Content-Type: application/json" \
   -d '{"project_name": "marx_brothers", "project_file": "marx_brothers.project.xml", "tool": "mscigt", "force": "true"}'
 
-#csmgvt
+# csmgvt
 curl -X POST http://localhost:5000/api/tools/execute-project \
   -H "Content-Type: application/json" \
   -d '{"project_name": "marx_brothers", "project_file": "marx_brothers.project.xml", "tool": "csmgvt"}'
 
-# Generate LDP platform with default compilation (log4cplus)
+# Generate LDP platform only
 curl -X POST http://localhost:5000/api/tools/execute-project \
   -H "Content-Type: application/json" \
   -d '{"project_name": "marx_brothers", "project_file": "marx_brothers.project.xml", "tool": "ldp"}'
+
+# Build generated LDP platform
+curl -X POST http://localhost:5000/api/tools/execute-project \
+  -H "Content-Type: application/json" \
+  -d '{"project_name": "marx_brothers", "project_file": "marx_brothers.project.xml", "tool": "make"}'
 ```

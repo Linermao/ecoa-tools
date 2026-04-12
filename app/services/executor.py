@@ -249,67 +249,77 @@ class ToolExecutor:
 
         logger.info(f"Created VSCode launch.json at: {launch_json_path}")
 
-    def _handle_ldp_compilation(
+    def _execute_make_in_project(
         self,
-        project_path: str,
         project_name: str,
-        compile_flag: Optional[bool],
+        project_path: str,
+        project_file: str,
         log_library: Optional[str],
-        cmake_options: Optional[List[str]]
+        cmake_options: Optional[List[str]],
+        make_options: Optional[List[str]]
     ) -> Dict[str, any]:
         """
-        Handle compilation logic for LDP tool.
+        Execute the standalone LDP build step (CMake + make).
 
         Args:
-            project_path: Project root directory
             project_name: Name of the project
-            compile_flag: Whether to compile (True/False/None for auto)
+            project_path: Project root directory
+            project_file: Project XML file name
             log_library: Logging library to use
             cmake_options: Additional CMake options
+            make_options: Additional make options
 
         Returns:
-            Compilation result dictionary, or empty dict if compilation was skipped
+            Execution-style result dictionary for the build step
         """
-        tool_config = self.config.get_tool("ldp")
-        compile_config = tool_config.get('compile', {}) if tool_config else {}
+        tool_config = self.config.get_tool("make")
+        build_config = tool_config.get("build", {}) if tool_config else {}
 
-        # Determine if compilation should be performed
-        should_compile = self._should_compile(compile_flag, compile_config)
-
-        if not should_compile:
-            logger.info(f"Compilation skipped for LDP (compile={compile_flag}, config.enabled={compile_config.get('enabled', False)})")
-            return {}
-
-        # Determine log_library value
         if log_library is None:
-            log_library = compile_config.get('default_log_library', 'log4cplus')
+            log_library = build_config.get("default_log_library", "log4cplus")
 
-        # Determine cmake_options
-        if cmake_options is None:
-            cmake_options = compile_config.get('cmake_options', [])
+        timeout = build_config.get("timeout", 600)
 
-        # Determine timeout
-        timeout = compile_config.get('timeout', 600)
-
-        logger.info(f"Starting LDP compilation with log_library={log_library}")
         compile_result = self._compile_ldp_project(
             project_path=project_path,
             log_library=log_library,
             cmake_options=cmake_options,
+            make_options=make_options,
             timeout=timeout,
         )
-        logger.info(f"LDP compilation {'succeeded' if compile_result.get('compile_success') else 'failed'}")
 
-        # Create VSCode launch.json if compilation succeeded
-        if compile_result.get('compile_success'):
+        if compile_result.get("compile_success"):
             self._create_vscode_launch_config(
                 project_path=project_path,
                 project_name=project_name,
-                build_dir=compile_result.get('build_dir', ''),
-                cmake_dir=compile_result.get('cmake_dir', '')
+                build_dir=compile_result.get("build_dir", ""),
+                cmake_dir=compile_result.get("cmake_dir", "")
             )
 
-        return compile_result
+        success = compile_result.get("compile_success", False)
+        message = "Tool make executed successfully" if success else "Tool make execution failed"
+
+        return {
+            "success": success,
+            "tool": "make",
+            "project_name": project_name,
+            "project_path": project_path,
+            "project_file": project_file,
+            "generated_files": [],
+            "stdout": compile_result.get("compile_stdout", ""),
+            "stderr": compile_result.get("compile_stderr", ""),
+            "return_code": compile_result.get("compile_return_code", -1),
+            "message": message,
+            "compile_success": success,
+            "compile_stdout": compile_result.get("compile_stdout", ""),
+            "compile_stderr": compile_result.get("compile_stderr", ""),
+            "compile_return_code": compile_result.get("compile_return_code", -1),
+            "executable_files": compile_result.get("executable_files", []),
+            "cmake_dir": compile_result.get("cmake_dir", ""),
+            "build_dir": compile_result.get("build_dir", ""),
+            "cmake_command": compile_result.get("cmake_command", ""),
+            "make_command": compile_result.get("make_command", ""),
+        }
 
     def _handle_csmgvt_compilation(
         self,
@@ -545,18 +555,17 @@ class ToolExecutor:
         project_path: str,
         log_library: str = "log4cplus",
         cmake_options: List[str] = None,
+        make_options: List[str] = None,
         timeout: int = 600
     ) -> Dict[str, any]:
         """
-        Execute CMake compilation for LDP-generated projects.
-
-        For LDP: tool success + make success = overall success
-                tool success + make failure = overall error
+        Execute CMake + make for an LDP-generated project.
 
         Args:
             project_path: Project root directory
             log_library: Logging library to use (log4cplus, zlog, lttng)
             cmake_options: Additional CMake options
+            make_options: Additional make options
             timeout: Compilation timeout in seconds
 
         Returns:
@@ -590,10 +599,13 @@ class ToolExecutor:
                 cmake_config_path = os.path.abspath(cmake_config_path)
                 logger.info(f"Using cmake_config.cmake: {cmake_config_path}")
 
-            # Get compile configuration
-            tool_config = self.config.get_tool("ldp")
-            compile_config = tool_config.get("compile", {}) if tool_config else {}
-            default_cmake_options = compile_config.get("cmake_options", [])
+            # Get build configuration from the standalone make tool.
+            tool_config = self.config.get_tool("make")
+            build_config = tool_config.get("build", {}) if tool_config else {}
+            default_cmake_options = build_config.get("cmake_options", [])
+            default_make_options = build_config.get("make_options", [])
+            selected_cmake_options = default_cmake_options if cmake_options is None else cmake_options
+            selected_make_options = default_make_options if make_options is None else make_options
 
             # Build CMake command with all required paths
             cmake_cmd = [
@@ -612,8 +624,8 @@ class ToolExecutor:
                 cmake_cmd.extend(["-C", cmake_config_path])
 
             # Add any additional cmake options
-            if cmake_options or default_cmake_options:
-                for opt in (cmake_options or default_cmake_options):
+            if selected_cmake_options:
+                for opt in selected_cmake_options:
                     cmake_cmd.append(opt.replace("${log_library}", log_library))
 
             # Execute CMake
@@ -629,7 +641,9 @@ class ToolExecutor:
             cmake_success = cmake_result.returncode == 0
 
             # Build make command
-            make_cmd = ["make", "--no-print-directory", "-C", build_dir, "all"]
+            make_cmd = ["make", "--no-print-directory", "-C", build_dir]
+            make_cmd.extend(selected_make_options)
+            make_cmd.append("all")
 
             # Execute make only if CMake succeeded
             make_result = None
@@ -844,6 +858,7 @@ class ToolExecutor:
         compile: Optional[bool] = None,
         log_library: str = None,
         cmake_options: List[str] = None,
+        make_options: List[str] = None,
         additional_args: List[str] = None,
         force: bool = False
     ) -> Dict[str, any]:
@@ -857,12 +872,13 @@ class ToolExecutor:
             verbose: Verbosity level (overrides default)
             checker: Checker tool for validation (e.g., 'ecoa-exvt')
             config_file: Config file name (for asctg tool)
-            compile: Whether to compile the project after tool execution (for ldp tool).
-                None: use configuration default (enabled: true),
+            compile: Whether to compile the project after tool execution (for csmgvt).
+                None: use configuration default,
                 True: always compile,
                 False: never compile
-            log_library: Logging library to use for compilation (log4cplus, zlog, lttng)
-            cmake_options: Additional CMake options for compilation
+            log_library: Logging library to use for make build (log4cplus, zlog, lttng)
+            cmake_options: Additional CMake options for make build
+            make_options: Additional make options for make build
             additional_args: Additional command line arguments
             force: Force overwrite existing files (adds -f flag for ldp, csmgvt, mscigt)
 
@@ -885,7 +901,9 @@ class ToolExecutor:
                 'compile_return_code': int (optional),
                 'executable_files': List[str] (optional),
                 'cmake_dir': str (optional),
-                'build_dir': str (optional)
+                'build_dir': str (optional),
+                'cmake_command': str (optional),
+                'make_command': str (optional)
             }
 
         Raises:
@@ -919,6 +937,16 @@ class ToolExecutor:
         if not os.path.exists(project_file_path):
             raise ProjectFileNotFoundError(
                 f"Project file not found: {project_file_path}"
+            )
+
+        if tool_id == 'make':
+            return self._execute_make_in_project(
+                project_name=project_name,
+                project_path=project_path,
+                project_file=project_file,
+                log_library=log_library,
+                cmake_options=cmake_options,
+                make_options=make_options,
             )
 
         # Get verbose level
@@ -1008,27 +1036,17 @@ class ToolExecutor:
                 generated_files = self._find_output_files(project_path, output_types)
                 logger.info(f"Found {len(generated_files)} generated files")
 
-            # Handle compilation for LDP and csmgvt separately
+            # Handle compilation for csmgvt separately
             compile_result = {}
             final_success = success
 
-            if success:
-                if tool_id == 'ldp':
-                    compile_result = self._handle_ldp_compilation(
-                        project_path, project_name, compile, log_library, cmake_options
-                    )
-                    # For LDP: tool success + make success = overall success
-                    #         tool success + make failure = overall error
-                    if compile_result:
-                        final_success = compile_result.get('compile_success', False)
-
-                elif tool_id == 'csmgvt':
-                    compile_result = self._handle_csmgvt_compilation(
-                        project_path, compile
-                    )
-                    # For csmgvt: same logic as LDP
-                    if compile_result:
-                        final_success = compile_result.get('compile_success', False)
+            if success and tool_id == 'csmgvt':
+                compile_result = self._handle_csmgvt_compilation(
+                    project_path, compile
+                )
+                # For csmgvt: tool success + compile success = overall success
+                if compile_result:
+                    final_success = compile_result.get('compile_success', False)
 
             # Prepare result dictionary
             result_dict = {
@@ -1053,7 +1071,9 @@ class ToolExecutor:
                     'compile_return_code': compile_result.get('compile_return_code', -1),
                     'executable_files': compile_result.get('executable_files', []),
                     'cmake_dir': compile_result.get('cmake_dir', ''),
-                    'build_dir': compile_result.get('build_dir', '')
+                    'build_dir': compile_result.get('build_dir', ''),
+                    'cmake_command': compile_result.get('cmake_command', ''),
+                    'make_command': compile_result.get('make_command', '')
                 })
 
             return result_dict

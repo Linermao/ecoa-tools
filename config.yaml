@@ -159,15 +159,40 @@ tools:
       - ".cpp"
       - ".mk"
       - ".cmake"
-    compile:
-      enabled: true
+    example: "ecoa-ldp -p marx_brothers.project.xml -k ecoa-exvt"
+
+  make:
+    command: make
+    name: "LDP Build"
+    description: "Configures and builds an LDP-generated project using CMake and make"
+    category: "build"
+    parameters:
+      - name: project_file
+        type: file
+        required: true
+        description: "Path to the ECOA project XML file"
+        flag: "-p"
+      - name: log_library
+        type: string
+        required: false
+        description: "Logging library used by the LDP build (log4cplus, zlog, lttng)"
+      - name: cmake_options
+        type: array
+        required: false
+        description: "Additional CMake options for the build"
+      - name: make_options
+        type: array
+        required: false
+        description: "Additional make options for the build"
+    build:
       default_log_library: "log4cplus"
       timeout: 600
       cmake_options:
         - "-DLDP_LOG_USE=${log_library}"
       make_options:
         - "-j"
-    example: "ecoa-ldp -p marx_brothers.project.xml -k ecoa-exvt"
+    output_types: []
+    example: "POST /api/tools/execute-project with tool=make"
 
 # API settings
 api:

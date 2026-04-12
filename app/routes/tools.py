@@ -178,13 +178,13 @@ def execute_in_project():
         {
             "project_name": "marx_brothers",
             "project_file": "marx_brothers.project.xml",
-            "tool": "asctg",
+            "tool": "make",
             "checker": "ecoa-exvt",
             "config_file": "ecoa_config.xml",
             "verbose": 3,
-            "compile": false,
             "log_library": "log4cplus",
             "cmake_options": ["-DLDP_LOG_USE=log4cplus"],
+            "make_options": ["-j"],
             "force": true
         }
 
@@ -195,9 +195,10 @@ def execute_in_project():
         - checker (optional): Checker tool for validation (default: ecoa-exvt)
         - config_file (optional): Config file name (required for asctg)
         - verbose (optional): Verbosity level (default: 3)
-        - compile (optional): Whether to compile project after tool execution (for ldp tool only, default: false)
-        - log_library (optional): Logging library for compilation (log4cplus, zlog, lttng, default: log4cplus)
-        - cmake_options (optional): Additional CMake options for compilation (array of strings)
+        - compile (optional): Whether to compile project after tool execution (for csmgvt only, default: false)
+        - log_library (optional): Logging library for make build (log4cplus, zlog, lttng, default: log4cplus)
+        - cmake_options (optional): Additional CMake options for make build (array of strings)
+        - make_options (optional): Additional make options for make build (array of strings)
         - force (optional): Force overwrite existing files (for ldp, csmgvt, mscigt tools, default: false)
 
     Returns:
@@ -213,13 +214,15 @@ def execute_in_project():
             "stdout": "...",
             "stderr": "...",
             "return_code": 0,
-            "compile_success": false (optional, present if compile=true),
+            "compile_success": false (optional, present for build responses),
             "compile_stdout": "..." (optional),
             "compile_stderr": "..." (optional),
             "compile_return_code": -1 (optional),
             "executable_files": [] (optional),
             "cmake_dir": "" (optional),
-            "build_dir": "" (optional)
+            "build_dir": "" (optional),
+            "cmake_command": "" (optional),
+            "make_command": "" (optional)
         }
     """
     with RequestContext(logger) as ctx:
@@ -242,6 +245,7 @@ def execute_in_project():
         compile_param = data.get('compile')  # None if not provided
         log_library = data.get('log_library')
         cmake_options = data.get('cmake_options')
+        make_options = data.get('make_options')
         force_param = data.get('force', False)  # Force overwrite existing files
 
         # Convert force parameter to boolean if provided
@@ -275,6 +279,16 @@ def execute_in_project():
                     ctx.warning(f"Invalid cmake_option type: {type(opt)}")
                     raise BadRequest("All cmake_options must be strings")
 
+        # Validate make_options if provided
+        if make_options is not None:
+            if not isinstance(make_options, list):
+                ctx.warning(f"Invalid make_options type: {type(make_options)}")
+                raise BadRequest("make_options must be a list of strings")
+            for opt in make_options:
+                if not isinstance(opt, str):
+                    ctx.warning(f"Invalid make_option type: {type(opt)}")
+                    raise BadRequest("All make_options must be strings")
+
         # Validate parameters
         if not project_name:
             ctx.warning("Missing project_name")
@@ -284,10 +298,16 @@ def execute_in_project():
             ctx.warning("Missing project_file")
             raise BadRequest("Missing required parameter: project_file")
 
-        ctx.info(f"Project: {project_name}, File: {project_file}, Tool: {tool_id}, Checker: {checker or 'default'}, Config: {config_file or 'N/A'}, Compile: {compile_param}, LogLibrary: {log_library or 'default'}, CMakeOptions: {len(cmake_options) if cmake_options else 0}, Force: {force_param}")
+        ctx.info(
+            f"Project: {project_name}, File: {project_file}, Tool: {tool_id}, "
+            f"Checker: {checker or 'default'}, Config: {config_file or 'N/A'}, "
+            f"Compile: {compile_param}, LogLibrary: {log_library or 'default'}, "
+            f"CMakeOptions: {len(cmake_options) if cmake_options else 0}, "
+            f"MakeOptions: {len(make_options) if make_options else 0}, Force: {force_param}"
+        )
 
-        # Warn if compile is requested for non-ldp/csmgvt tools
-        if compile_param and tool_id not in ['ldp', 'csmgvt']:
+        # Warn if compile is requested for tools that do not support inline compilation.
+        if compile_param and tool_id != 'csmgvt':
             ctx.warning(f"Compilation requested for tool {tool_id} which doesn't support compilation. Compilation will be ignored.")
 
         # Validate tool exists
@@ -305,7 +325,11 @@ def execute_in_project():
         try:
             result = executor.execute_in_project(
                 tool_id, project_name, project_file, verbose, checker, config_file,
-                compile=compile_param, log_library=log_library, cmake_options=cmake_options, force=force_param
+                compile=compile_param,
+                log_library=log_library,
+                cmake_options=cmake_options,
+                make_options=make_options,
+                force=force_param
             )
 
             if result['success']:
@@ -336,7 +360,9 @@ def execute_in_project():
                     'compile_return_code': result.get('compile_return_code', -1),
                     'executable_files': result.get('executable_files', []),
                     'cmake_dir': result.get('cmake_dir', ''),
-                    'build_dir': result.get('build_dir', '')
+                    'build_dir': result.get('build_dir', ''),
+                    'cmake_command': result.get('cmake_command', ''),
+                    'make_command': result.get('make_command', '')
                 })
 
             return jsonify(response_data)
