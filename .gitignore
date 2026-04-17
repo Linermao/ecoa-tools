@@ -16,6 +16,7 @@ uploads/
 outputs/
 logs/
 *.log
+.tmp-tests/
 
 # OS
 .DS_Store

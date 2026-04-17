@@ -152,7 +152,7 @@ Content-Type: application/json
 | `verbose`       | integer | No       | `3`                 | Verbosity level (0-4)                                                                                                                                       |
 | `checker`       | string  | No       | `ecoa-exvt`         | Checker tool for validation                                                                                                                                 |
 | `config_file`   | string  | No       | -                   | Config file name (required for `asctg` tool)                                                                                                                |
-| `force`         | boolean | No       | `false`             | Force overwrite existing files (applies to `ldp`, `csmgvt`, `mscigt` tools). Adds `-f` flag to the tool command.                                            |
+| `force`         | boolean | No       | `false`             | Force overwrite existing files (applies to `ldp`, `csmgvt`, `mscigt` tools). Adds `-f` flag to the tool command. `ldp` defaults to safe mode so existing business code is preserved unless `force: true` is requested. |
 
 > **Note:** The `compile`, `log_library`, and `cmake_options` parameters only apply to the `ldp` tool. If specified for other tools, they will be ignored.
 >

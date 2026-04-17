@@ -3,13 +3,13 @@
 import os
 import subprocess
 import shutil
-import json
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime
 
 from app.utils.config import get_config
 from app.utils.logger import setup_logger
+from app.services.distributed_debug import collect_debug_topology, write_distributed_debug_assets
 
 # Initialize logger for this module
 logger = setup_logger('app.services.executor')
@@ -207,43 +207,9 @@ class ToolExecutor:
 
         # Provide a target directory for .vscode (use workspace_dir if provided, else project_path)
         target_dir = workspace_dir if workspace_dir else project_path
-        vscode_dir = os.path.join(target_dir, ".vscode")
-        Path(vscode_dir).mkdir(parents=True, exist_ok=True)
-
-        # Calculate relative path from target_dir to executable
-        try:
-            rel_build_dir = os.path.relpath(build_dir, target_dir)
-        except ValueError:
-            # On different drives on Windows, use absolute path
-            rel_build_dir = build_dir
-
-        # Build the program path for VSCode (relative to workspace folder)
-        program_path = f"${{workspaceFolder}}/{rel_build_dir}/bin/platform"
-
-        # Build cwd path
-        cwd_path = f"${{workspaceFolder}}/{rel_build_dir}/bin"
-
-        launch_json_content = {
-            "version": "0.2.0",
-            "configurations": [
-                {
-                    "name": f"Debug platform",
-                    "type": "cppdbg",
-                    "request": "launch",
-                    "program": program_path,
-                    "cwd": cwd_path,
-                    "args": [],
-                    "stopAtEntry": True,
-                    "MIMode": "gdb",
-                }
-            ]
-        }
-
-        launch_json_path = os.path.join(vscode_dir, "launch.json")
-        with open(launch_json_path, 'w') as f:
-            json.dump(launch_json_content, f, indent=2)
-
-        logger.info(f"Created VSCode launch.json at: {launch_json_path}")
+        topology = collect_debug_topology(project_path=project_path, build_dir=build_dir)
+        assets = write_distributed_debug_assets(target_dir=target_dir, build_dir=build_dir, topology=topology)
+        logger.info(f"Created VSCode launch.json at: {assets['launch_json']}")
 
 
 
@@ -691,6 +657,7 @@ class ToolExecutor:
         compile: Optional[bool] = None,
         log_library: str = None,
         cmake_options: List[str] = None,
+        force: Optional[bool] = None,
         additional_args: List[str] = None,
         workspace_dir: str = None,
     ) -> Dict[str, any]:
@@ -710,6 +677,10 @@ class ToolExecutor:
                 False: never compile
             log_library: Logging library to use for compilation (log4cplus, zlog, lttng)
             cmake_options: Additional CMake options for compilation
+            force: Whether to force overwrite generated files.
+                None: use tool configuration default,
+                True: always add force flag,
+                False: never add force flag
 
         Returns:
             Dictionary with execution result:
@@ -813,12 +784,21 @@ class ToolExecutor:
         if checker:
             cmd.extend(['-k', checker])
 
-        # Add boolean flags from config if they are true by default
+        # Add boolean flags using explicit request overrides when provided.
         for param in tool_config.get('parameters', []):
-            if param.get('type') == 'boolean' and param.get('default') is True:
-                flag = param.get('flag')
-                if flag and flag not in cmd:
-                    cmd.append(flag)
+            if param.get('type') != 'boolean':
+                continue
+
+            param_name = param.get('name')
+            default_enabled = param.get('default') is True
+            enabled = default_enabled
+
+            if param_name == 'force' and force is not None:
+                enabled = force
+
+            flag = param.get('flag')
+            if enabled and flag and flag not in cmd:
+                cmd.append(flag)
 
         # Add verbose flag based on tool's verbose_type
         verbose_type = tool_config.get('verbose_type', 'boolean')

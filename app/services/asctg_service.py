@@ -433,3 +433,39 @@ def execute_asctg_from_steps_dir(
         }
     )
     return result
+
+
+def build_asctg_logs(
+    project_id: str,
+    steps_dir: str,
+    selected_components: list[str],
+    result: dict,
+) -> list[str]:
+    """Build detailed frontend logs for an ASCTG execution."""
+    logs: list[str] = [
+        f"[ASCTG] Project: {project_id}",
+        f"[ASCTG] Steps dir: {steps_dir}",
+        f"[ASCTG] Selected components: {', '.join(selected_components) if selected_components else '(auto config mode)'}",
+    ]
+
+    if result.get("composite_path"):
+        logs.append(f"[ASCTG] Composite: {result['composite_path']}")
+    if result.get("config_path"):
+        logs.append(f"[ASCTG] Config: {result['config_path']}")
+    if result.get("workspace_root"):
+        logs.append(f"[ASCTG] Workspace: {result['workspace_root']}")
+
+    for line in (result.get("stdout") or "").splitlines():
+        if line.strip():
+            logs.append(f"[ASCTG] {line}")
+    for line in (result.get("stderr") or "").splitlines():
+        if line.strip():
+            logs.append(f"[ASCTG] [STDERR] {line}")
+
+    if result.get("return_code") is not None:
+        logs.append(f"[ASCTG] Return code: {result['return_code']}")
+
+    if result.get("error"):
+        logs.append(f"[ASCTG] [ERROR] {result['error']}")
+
+    return logs

@@ -1,5 +1,5 @@
 # ECOA Tools Development Environment
-FROM ubuntu:22.04
+FROM docker.1ms.run/ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /app

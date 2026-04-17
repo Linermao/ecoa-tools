@@ -161,7 +161,7 @@ tools:
         required: false
         description: "Force overwrite existing directories"
         flag: "-f"
-        default: true
+        default: false
     output_types:
       - ".h"
       - ".c"
