@@ -16,6 +16,15 @@ import requests
 from flask import Blueprint, jsonify, request
 
 from app.services.asctg_service import build_asctg_logs, execute_asctg_from_steps_dir
+from app.services.generation_workflow import (
+    WorkflowContext,
+    activate_harness_project,
+    default_selected_phases,
+    parse_continuing_flag,
+    resolve_phase_steps,
+    should_await_code,
+    validate_phase_selection,
+)
 from app.services.executor import ToolExecutor
 from app.utils.logger import setup_logger
 
@@ -35,6 +44,51 @@ PHASE_STEPS = [
     dict(phaseId="CSMGVT", toolId="csmgvt", subStatus="RUNNING_CSMGVT", label="[CSMGVT] Cork/Stub Gen", pStart=60, pEnd=80, needsCfg=False),
     dict(phaseId="LDP", toolId="ldp", subStatus="RUNNING_LDP", label="[LDP] Middleware Builder", pStart=80, pEnd=100, needsCfg=False),
 ]
+PHASE_STEP_LOOKUP = {step["phaseId"]: step for step in PHASE_STEPS}
+
+
+def _resolve_pipeline_steps(selected_phases: list[str], workflow_mode: str | None, continuing: bool) -> list[dict]:
+    """Return the concrete phase plan for this request with monotonically increasing progress."""
+    ordered_phase_ids = selected_phases
+    if workflow_mode is not None:
+        ordered_phase_ids = resolve_phase_steps(workflow_mode, selected_phases, continuing)
+
+    if not ordered_phase_ids:
+        return []
+
+    total_steps = len(ordered_phase_ids)
+    base_progress = 5
+    available_progress = 95
+    previous_end = base_progress
+    resolved_steps: list[dict] = []
+
+    for index, phase_id in enumerate(ordered_phase_ids):
+        template = PHASE_STEP_LOOKUP[phase_id]
+        if index == total_steps - 1:
+            progress_end = 100
+        else:
+            progress_end = base_progress + (available_progress * (index + 1)) // total_steps
+
+        step = dict(template)
+        step["pStart"] = previous_end
+        step["pEnd"] = progress_end
+        resolved_steps.append(step)
+        previous_end = progress_end
+
+    return resolved_steps
+
+
+def _workflow_callback_fields(context: WorkflowContext) -> dict:
+    return {
+        "workflowMode": context.workflow_mode,
+        "baseProjectFile": context.base_project_file,
+        "activeProjectFile": context.active_project_file,
+        "harnessProjectFile": context.harness_project_file,
+    }
+
+
+def _callback_payload(payload: dict, context: WorkflowContext) -> dict:
+    return {**payload, **_workflow_callback_fields(context)}
 
 
 def _send_callback(callback_url: str, payload: dict, task_id: str) -> None:
@@ -208,18 +262,35 @@ def _run_pipeline(
     continue_on_error: bool,
     phase_params: dict,
     skip_export: bool,
+    workflow_mode: str | None = None,
+    continuing: bool = False,
+    base_project_file: str | None = None,
+    active_project_file: str | None = None,
+    harness_project_file: str | None = None,
 ) -> None:
     """Background pipeline execution (runs in a daemon thread)."""
     executor = ToolExecutor()
     had_failure = False
     output_path = output_dir
     tool_cwd = f"{project_id}/{task_id}/Steps"
+    mode = workflow_mode or "INTEGRATION"
 
-    project_name, project_file, steps_root = _resolve_project_file(project_id, task_id, skip_export, callback_url, task_id)
-    if not project_file or not steps_root:
+    project_name, resolved_project_file, steps_root = _resolve_project_file(project_id, task_id, skip_export, callback_url, task_id)
+    if not resolved_project_file or not steps_root:
         return
 
-    for step in PHASE_STEPS:
+    context = WorkflowContext(
+        workflow_mode=mode,
+        base_project_file=base_project_file or resolved_project_file,
+        active_project_file=active_project_file or base_project_file or resolved_project_file,
+        harness_project_file=harness_project_file,
+        selected_phases=selected_phases[:],
+        continuing=continuing,
+    )
+
+    pipeline_steps = _resolve_pipeline_steps(selected_phases, workflow_mode, continuing)
+
+    for step in pipeline_steps:
         phase_id = step["phaseId"]
         tool_id = step["toolId"]
         sub_status = step["subStatus"]
@@ -228,28 +299,18 @@ def _run_pipeline(
         p_end = step["pEnd"]
         needs_cfg = step["needsCfg"]
 
-        if phase_id not in selected_phases:
-            _send_callback(
-                callback_url,
-                {
-                    "status": "GENERATING",
-                    "subStatus": "NONE",
-                    "progress": p_end,
-                    "logs": [f"[SKIP] Phase not selected: {phase_id} ({tool_id})"],
-                },
-                task_id,
-            )
-            continue
-
         logger.info("[Pipeline] %s ...", label)
         _send_callback(
             callback_url,
-            {
+            _callback_payload(
+                {
                 "status": "GENERATING",
                 "subStatus": sub_status,
                 "progress": p_start,
                 "logs": [f"{label} started."],
-            },
+                },
+                context,
+            ),
             task_id,
         )
 
@@ -269,17 +330,23 @@ def _run_pipeline(
             if not selected_components:
                 config_file = _find_config_file(project_id, task_id)
                 if not config_file:
+                    had_failure = True
                     _send_callback(
                         callback_url,
-                        {
-                            "status": "GENERATING",
+                        _callback_payload(
+                            {
+                            "status": "FAILED",
                             "subStatus": sub_status,
                             "progress": p_end,
-                            "logs": ["[ASCTG] [WARN] No ASCTG config file found, skipping phase."],
-                        },
+                            "outputPath": output_path,
+                            "logs": ["[ASCTG] [ERROR] Missing selected components or config.xml"],
+                            },
+                            context,
+                        ),
                         task_id,
                     )
-                    continue
+                    logger.error("[Pipeline] ASCTG task=%s missing selected components and config.xml", task_id)
+                    return
 
         if additional_args:
             logger.info("[Pipeline] %s extra args: %s", label, additional_args)
@@ -294,11 +361,11 @@ def _run_pipeline(
                 result = executor.execute_in_project(
                     tool_id=tool_id,
                     project_name=tool_cwd,
-                    project_file=project_file,
+                    project_file=context.active_project_file,
                     verbose=3,
                     checker=None,
                     config_file=config_file,
-                    compile=False if tool_id == "ldp" else None,
+                    compile=True if tool_id == "ldp" else None,
                     additional_args=additional_args,
                     workspace_dir=str(steps_root),
                 )
@@ -325,24 +392,51 @@ def _run_pipeline(
         if tool_logs:
             _send_callback(
                 callback_url,
-                {
+                _callback_payload(
+                    {
                     "status": "GENERATING",
                     "subStatus": sub_status,
                     "progress": mid_progress,
                     "logs": tool_logs,
-                },
+                    },
+                    context,
+                ),
                 task_id,
             )
 
         if success:
+            if tool_id == "asctg" and mode == "HARNESS":
+                try:
+                    context = activate_harness_project(context, steps_root)
+                except FileNotFoundError as exc:
+                    had_failure = True
+                    _send_callback(
+                        callback_url,
+                        _callback_payload(
+                            {
+                            "status": "FAILED",
+                            "subStatus": sub_status,
+                            "progress": p_end,
+                            "outputPath": output_path,
+                            "logs": [f"{label} [ERROR] {exc}"],
+                            },
+                            context,
+                        ),
+                        task_id,
+                    )
+                    logger.error("[Pipeline] %s task=%s, error=%s", tool_id, task_id, exc)
+                    return
             _send_callback(
                 callback_url,
-                {
+                _callback_payload(
+                    {
                     "status": "GENERATING",
                     "subStatus": sub_status,
                     "progress": p_end,
                     "logs": [f"{label} completed successfully."],
-                },
+                    },
+                    context,
+                ),
                 task_id,
             )
             continue
@@ -359,37 +453,37 @@ def _run_pipeline(
             fail_logs.append(f"[WARN] continueOnError=true, continuing after {tool_id} failure.")
             _send_callback(
                 callback_url,
-                {
+                _callback_payload(
+                    {
                     "status": "GENERATING",
                     "subStatus": sub_status,
                     "progress": p_end,
                     "logs": fail_logs,
-                },
+                    },
+                    context,
+                ),
                 task_id,
             )
         else:
             _send_callback(
                 callback_url,
-                {
+                _callback_payload(
+                    {
                     "status": "FAILED",
                     "subStatus": sub_status,
                     "progress": p_end,
                     "outputPath": output_path,
                     "logs": fail_logs,
-                },
+                    },
+                    context,
+                ),
                 task_id,
             )
             logger.error("[Pipeline] FAILED at %s, aborting task %s", tool_id, task_id)
             return
 
-    modeling_phases = {"MSCIGT", "ASCTG"}
-    execution_phases = {"CSMGVT", "LDP"}
-    any_modeling_selected = any(phase in selected_phases for phase in modeling_phases)
-    any_execution_selected = any(phase in selected_phases for phase in execution_phases)
-
-    status = "COMPLETED"
-    if any_modeling_selected and not any_execution_selected and not had_failure:
-        status = "AWAITING_CODE"
+    status = "AWAITING_CODE" if should_await_code(mode, selected_phases, had_failure, continuing) else "COMPLETED"
+    if status == "AWAITING_CODE":
         final_logs = [
             "Skeleton generation finished.",
             "Open Code Server, add your business code, then continue with CSMGVT or LDP.",
@@ -405,13 +499,16 @@ def _run_pipeline(
     logger.info("[Pipeline] %s task=%s, outputPath=%s", status, task_id, output_path)
     _send_callback(
         callback_url,
-        {
+        _callback_payload(
+            {
             "status": status,
             "subStatus": "NONE",
             "progress": 100,
             "outputPath": output_path,
             "logs": final_logs,
-        },
+            },
+            context,
+        ),
         task_id,
     )
 
@@ -487,6 +584,10 @@ def trigger_generation():
     project_id = data.get("project_id") or data.get("projectId")
     step_name = data.get("step_name") or data.get("stepName")
     callback_url = data.get("callback_url") or data.get("callbackUrl")
+    workflow_mode = data.get("workflowMode") or data.get("workflow_mode")
+    base_project_file = data.get("baseProjectFile") or data.get("base_project_file")
+    active_project_file = data.get("activeProjectFile") or data.get("active_project_file")
+    harness_project_file = data.get("harnessProjectFile") or data.get("harness_project_file")
 
     if step_name == "generate_harness":
         steps_dir = data.get("steps_dir") or data.get("stepsDir")
@@ -515,13 +616,44 @@ def trigger_generation():
         return jsonify({"success": True, "message": "Accepted", "task_id": task_id, "project_id": project_id, "step_name": step_name}), 202
 
     output_dir = data.get("outputDir", "/workspace")
-    selected_phases = data.get("selectedPhases", ["EXVT", "ASCTG", "MSCIGT", "CSMGVT", "LDP"])
+    selected_phases_present = "selectedPhases" in data
+    selected_phases = data.get("selectedPhases")
     continue_on_error = bool(data.get("continueOnError", False))
     phase_params = data.get("phaseParams", {})
     skip_export = bool(data.get("skipExport", False))
+    continuing = False
 
     if not task_id or not project_id or not callback_url:
         return jsonify({"success": False, "error": "taskId, projectId and callbackUrl are required"}), 400
+
+    if selected_phases_present and selected_phases == []:
+        error_message = "selectedPhases must be a non-empty list of strings"
+        return jsonify({"success": False, "error": error_message, "message": error_message}), 400
+
+    if workflow_mode is not None:
+        try:
+            continuing = parse_continuing_flag(data.get("continuing", False))
+        except ValueError as exc:
+            error_message = str(exc)
+            return jsonify({"success": False, "error": error_message, "message": error_message}), 400
+
+        if selected_phases is not None and (
+            not isinstance(selected_phases, list) or not all(isinstance(phase, str) for phase in selected_phases)
+        ):
+            return jsonify({"success": False, "error": "selectedPhases must be a list of strings"}), 400
+
+        try:
+            validate_phase_selection(workflow_mode, selected_phases, continuing)
+        except ValueError as exc:
+            error_message = str(exc)
+            return jsonify({"success": False, "error": error_message, "message": error_message}), 400
+
+        if selected_phases is None:
+            selected_phases = default_selected_phases(workflow_mode, continuing)
+
+        selected_phases = resolve_phase_steps(workflow_mode, selected_phases, continuing)
+    else:
+        selected_phases = selected_phases or ["EXVT", "ASCTG", "MSCIGT", "CSMGVT", "LDP"]
 
     logger.info(
         "[API] Generate accepted: task=%s project=%s phases=%s continueOnError=%s skipExport=%s params=%s",
@@ -535,7 +667,21 @@ def trigger_generation():
 
     thread = threading.Thread(
         target=_run_pipeline,
-        args=(task_id, project_id, output_dir, callback_url, selected_phases, continue_on_error, phase_params, skip_export),
+        args=(
+            task_id,
+            project_id,
+            output_dir,
+            callback_url,
+            selected_phases,
+            continue_on_error,
+            phase_params,
+            skip_export,
+            workflow_mode,
+            continuing,
+            base_project_file,
+            active_project_file,
+            harness_project_file,
+        ),
         daemon=True,
     )
     thread.start()

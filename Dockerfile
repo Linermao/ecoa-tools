@@ -21,6 +21,7 @@ RUN apt-get update && apt-get install -y \
     gcc \
     g++ \
     gdb \
+    gdbserver \
     cmake \
     make \
     gdb \
@@ -35,6 +36,8 @@ RUN apt-get update && apt-get install -y \
     pkg-config \
     ca-certificates \
     curl \
+    docker.io \
+    docker-compose-v2 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 

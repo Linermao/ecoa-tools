@@ -10,9 +10,11 @@ from xml.etree import ElementTree
 DEBUG_START_PORT = 2000
 LOCAL_LAUNCH_NAME = "Debug platform"
 COMPOUND_NAME = "Attach distributed ECOA"
+COMPOSE_PROJECT_NAME = "ecoa-distributed-debug"
 COMPOSE_FILENAME = "distributed-debug.compose.yml"
 START_SCRIPT_FILENAME = "start-distributed-debug.sh"
 STOP_SCRIPT_FILENAME = "stop-distributed-debug.sh"
+STATUS_SCRIPT_FILENAME = "status-distributed-debug.sh"
 CONTAINER_PROJECT_ROOT = "/workspace/project"
 
 
@@ -33,6 +35,34 @@ class DebugTopology:
     is_distributed: bool
 
 
+def container_binary_dir(build_dir: str) -> str:
+    """Return the in-container path to the generated binary directory."""
+    build_path = Path(build_dir)
+    build_parts = build_path.parts
+    output_index = next(
+        (index for index, part in enumerate(build_parts) if part.lower().startswith("6-output")),
+        None,
+    )
+    if output_index is None:
+        raise ValueError(f"Build directory is not under a 6-output directory: {build_dir}")
+
+    relative_build_dir = Path(*build_parts[output_index:])
+    return f"{CONTAINER_PROJECT_ROOT}/{relative_build_dir.as_posix()}/bin"
+
+
+def gdbserver_command(build_dir: str, process: DebugProcess) -> str:
+    """Return the shell command used to start gdbserver for a process."""
+    binary_dir = container_binary_dir(build_dir)
+    library_dir = f"{Path(binary_dir).parent.as_posix()}/lib"
+    return (
+        f"mkdir -p {binary_dir}/../logs && "
+        f"cd {binary_dir} && "
+        f"export LD_LIBRARY_PATH={library_dir}:${{LD_LIBRARY_PATH:-}} && "
+        f"nohup gdbserver 0.0.0.0:{process.port} ./{process.name} "
+        f"> ../logs/{process.name}.gdbserver.log 2>&1 &"
+    )
+
+
 def _local_name(tag: str) -> str:
     if "}" in tag:
         return tag.rsplit("}", 1)[1]
@@ -41,6 +71,22 @@ def _local_name(tag: str) -> str:
 
 def _sanitize_service_name(node_id: str) -> str:
     return "".join(character if character.isalnum() else "-" for character in node_id.lower()).strip("-")
+
+
+def _yaml_single_quote(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _service_name_by_host(node_hosts: Dict[str, str]) -> Dict[str, str]:
+    grouped_nodes: Dict[str, List[str]] = {}
+    for node_id, host in node_hosts.items():
+        grouped_nodes.setdefault(host, []).append(node_id)
+
+    service_names: Dict[str, str] = {}
+    for host, node_ids in grouped_nodes.items():
+        preferred_node_id = next((node_id for node_id in node_ids if node_id != "main"), node_ids[0])
+        service_names[host] = f"ecoa-{_sanitize_service_name(preferred_node_id)}"
+    return service_names
 
 
 def _find_integration_dir(project_path: str) -> Optional[Path]:
@@ -55,37 +101,135 @@ def _find_integration_dir(project_path: str) -> Optional[Path]:
     return None
 
 
-def _parse_deployment_processes(integration_dir: Path) -> List[tuple[str, str]]:
+def _resolve_project_file_path(project_path: str, project_file: Optional[str]) -> Optional[Path]:
+    if not project_file:
+        return None
+
+    candidate = Path(project_file)
+    if not candidate.is_absolute():
+        candidate = Path(project_path) / project_file
+    if candidate.exists():
+        return candidate
+
+    for existing_project_file in sorted(Path(project_path).rglob("*.project.xml")):
+        if existing_project_file.name == project_file:
+            return existing_project_file
+    return None
+
+
+def _project_deployment_file(project_file_path: Path) -> Optional[Path]:
+    try:
+        root = ElementTree.parse(project_file_path).getroot()
+    except ElementTree.ParseError:
+        return None
+
+    for element in root:
+        if _local_name(element.tag) != "deploymentSchema":
+            continue
+        deployment_schema = (element.text or "").strip()
+        if not deployment_schema:
+            continue
+
+        deployment_file = project_file_path.parent / deployment_schema
+        if deployment_file.exists():
+            return deployment_file
+    return None
+
+
+def _deployment_candidates(project_path: str, integration_dir: Path, project_file: Optional[str]) -> List[Path]:
+    requested_project_file = _resolve_project_file_path(project_path, project_file)
+    if requested_project_file is not None:
+        requested_deployment = _project_deployment_file(requested_project_file)
+        if requested_deployment is not None:
+            return [requested_deployment]
+
+    deployment_candidates: List[Path] = []
+    seen_candidates = set()
+    for project_xml in sorted(Path(project_path).rglob("*.project.xml")):
+        deployment_file = _project_deployment_file(project_xml)
+        if deployment_file is None:
+            continue
+        deployment_key = str(deployment_file)
+        if deployment_key in seen_candidates:
+            continue
+        seen_candidates.add(deployment_key)
+        deployment_candidates.append(deployment_file)
+
+    if deployment_candidates:
+        return deployment_candidates
+
+    return sorted(integration_dir.glob("*.deployment.xml"))
+
+
+def _built_debug_binaries(build_dir: str) -> set[str]:
+    bin_dir = Path(build_dir) / "bin"
+    if not bin_dir.exists():
+        return set()
+
+    return {
+        file_path.name
+        for file_path in bin_dir.iterdir()
+        if file_path.is_file() and file_path.name.startswith("PD_")
+    }
+
+
+def _parse_deployment_processes(deployment_file: Path) -> List[tuple[str, str]]:
     processes: List[tuple[str, str]] = []
 
-    for xml_path in sorted(integration_dir.rglob("*.xml")):
-        try:
-            root = ElementTree.parse(xml_path).getroot()
-        except ElementTree.ParseError:
+    try:
+        root = ElementTree.parse(deployment_file).getroot()
+    except ElementTree.ParseError:
+        return processes
+
+    if _local_name(root.tag) != "deployment":
+        return processes
+
+    for element in root:
+        if _local_name(element.tag) != "protectionDomain":
             continue
 
-        if _local_name(root.tag) != "deployment":
+        name = element.get("name")
+        if not name:
             continue
 
-        for element in root:
-            if _local_name(element.tag) != "protectionDomain":
-                continue
+        execute_on = next((child for child in element if _local_name(child.tag) == "executeOn"), None)
+        if execute_on is None:
+            continue
 
-            name = element.get("name")
-            if not name:
-                continue
+        node_id = execute_on.get("computingNode")
+        if not node_id:
+            continue
 
-            execute_on = next((child for child in element if _local_name(child.tag) == "executeOn"), None)
-            if execute_on is None:
-                continue
-
-            node_id = execute_on.get("computingNode")
-            if not node_id:
-                continue
-
-            processes.append((f"PD_{name}", node_id))
+        processes.append((f"PD_{name}", node_id))
 
     return processes
+
+
+def _find_deployment_file(
+    project_path: str,
+    integration_dir: Path,
+    build_dir: str,
+    project_file: Optional[str],
+) -> Optional[Path]:
+    deployment_candidates = _deployment_candidates(project_path, integration_dir, project_file)
+    if not deployment_candidates:
+        return None
+
+    if len(deployment_candidates) == 1:
+        return deployment_candidates[0]
+
+    built_binaries = _built_debug_binaries(build_dir)
+    if not built_binaries:
+        return deployment_candidates[0]
+
+    def score(candidate: Path) -> tuple[int, int, int]:
+        expected_binaries = {process_name for process_name, _node_id in _parse_deployment_processes(candidate)}
+        matches = len(expected_binaries & built_binaries)
+        missing = len(expected_binaries - built_binaries)
+        extras = len(built_binaries - expected_binaries)
+        return (matches, -missing, -extras)
+
+    return max(deployment_candidates, key=score)
 
 
 def _parse_nodes_deployment(integration_dir: Path) -> Dict[str, str]:
@@ -119,8 +263,7 @@ def _derive_docker_subnet(addresses: List[str]) -> str:
     raise ValueError("All nodes must share a common network prefix for Docker bridge generation")
 
 
-def collect_debug_topology(project_path: str, build_dir: str) -> Optional[DebugTopology]:
-    del build_dir
+def collect_debug_topology(project_path: str, build_dir: str, project_file: Optional[str] = None) -> Optional[DebugTopology]:
     integration_dir = _find_integration_dir(project_path)
     if integration_dir is None:
         return None
@@ -129,7 +272,11 @@ def collect_debug_topology(project_path: str, build_dir: str) -> Optional[DebugT
     if not node_hosts:
         return None
 
-    pd_processes = _parse_deployment_processes(integration_dir)
+    deployment_file = _find_deployment_file(project_path, integration_dir, build_dir, project_file)
+    if deployment_file is None:
+        return None
+
+    pd_processes = _parse_deployment_processes(deployment_file)
     if not pd_processes:
         return None
 
@@ -137,13 +284,14 @@ def collect_debug_topology(project_path: str, build_dir: str) -> Optional[DebugT
     if not platform_host:
         return None
 
+    service_names = _service_name_by_host(node_hosts)
     processes = [
         DebugProcess(
             name="platform",
             node_id="main",
             host=platform_host,
             port=DEBUG_START_PORT,
-            service_name="ecoa-main",
+            service_name=service_names[platform_host],
         )
     ]
 
@@ -157,7 +305,7 @@ def collect_debug_topology(project_path: str, build_dir: str) -> Optional[DebugT
                 node_id=node_id,
                 host=host,
                 port=DEBUG_START_PORT + index,
-                service_name=f"ecoa-{_sanitize_service_name(node_id)}",
+                service_name=service_names[host],
             )
         )
 
@@ -217,28 +365,41 @@ def _distributed_launch_config(target_dir: str, build_dir: str, process: DebugPr
     }
 
 
-def _compose_yaml(build_dir: str, topology: DebugTopology) -> str:
+def _compose_yaml(
+    build_dir: str,
+    topology: DebugTopology,
+    project_mount_source: str = "..",
+    debug_image: Optional[str] = None,
+    compose_project_name: str = COMPOSE_PROJECT_NAME,
+    network_name: Optional[str] = None,
+) -> str:
     rel_bin_dir = Path(build_dir).name
     del rel_bin_dir
-    binary_dir = f"{CONTAINER_PROJECT_ROOT}/{Path(build_dir).relative_to(Path(build_dir).parents[1]).as_posix()}/bin"
+    binary_dir = container_binary_dir(build_dir)
+    image_reference = debug_image or "${ECOA_DISTRIBUTED_DEBUG_IMAGE:-sirius-web-code-server:latest}"
+    compose_network_name = network_name or f"{compose_project_name}_ecoa_debug_net"
     lines = [
-        'name: ecoa-distributed-debug',
+        f"name: {compose_project_name}",
         'services:',
     ]
 
     unique_services = {}
     for process in topology.processes:
-        unique_services[process.service_name] = (process.node_id, process.host)
+        existing = unique_services.get(process.service_name)
+        if existing is None or (existing[0] == "main" and process.node_id != "main"):
+            unique_services[process.service_name] = (process.node_id, process.host)
 
     for service_name, (node_id, host) in unique_services.items():
         lines.extend(
             [
                 f"  {service_name}:",
-                '    image: ${ECOA_DISTRIBUTED_DEBUG_IMAGE:-sirius-web-code-server:latest}',
+                f"    image: {image_reference}",
                 '    command: ["bash", "-lc", "sleep infinity"]',
                 f'    working_dir: "{binary_dir}"',
                 '    volumes:',
-                f'      - "..:{CONTAINER_PROJECT_ROOT}"',
+                '      - type: bind',
+                f"        source: {_yaml_single_quote(project_mount_source)}",
+                f'        target: "{CONTAINER_PROJECT_ROOT}"',
                 '    environment:',
                 f'      ECOA_NODE_ID: "{node_id}"',
                 '    networks:',
@@ -251,6 +412,7 @@ def _compose_yaml(build_dir: str, topology: DebugTopology) -> str:
         [
             'networks:',
             '  ecoa_debug_net:',
+            f'    name: {compose_network_name}',
             '    driver: bridge',
             '    ipam:',
             '      config:',
@@ -260,38 +422,78 @@ def _compose_yaml(build_dir: str, topology: DebugTopology) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _start_script(build_dir: str, topology: DebugTopology) -> str:
-    binary_dir = f"{CONTAINER_PROJECT_ROOT}/{Path(build_dir).relative_to(Path(build_dir).parents[1]).as_posix()}/bin"
+def render_distributed_debug_compose(
+    build_dir: str,
+    topology: DebugTopology,
+    project_mount_source: str = "..",
+    debug_image: Optional[str] = None,
+    compose_project_name: str = COMPOSE_PROJECT_NAME,
+    network_name: Optional[str] = None,
+) -> str:
+    """Render the distributed debug compose definition."""
+    return _compose_yaml(
+        build_dir,
+        topology,
+        project_mount_source=project_mount_source,
+        debug_image=debug_image,
+        compose_project_name=compose_project_name,
+        network_name=network_name,
+    )
+
+
+def _api_script(endpoint: str, method: str = "POST") -> str:
     lines = [
         "#!/usr/bin/env bash",
         "set -euo pipefail",
         "",
-        "docker compose -f .vscode/distributed-debug.compose.yml up -d",
+        'export ECOA_DISTRIBUTED_DEBUG_API_URL="${ECOA_DISTRIBUTED_DEBUG_API_URL:-http://ecoa-tools:5000}"',
+        "",
+        "python - <<'PY'",
+        "import json",
+        "import os",
+        "import sys",
+        "import urllib.error",
+        "import urllib.parse",
+        "import urllib.request",
+        "",
+        'api_base_url = os.environ["ECOA_DISTRIBUTED_DEBUG_API_URL"].rstrip("/")',
+        'payload = {',
+        '    "target_dir": os.environ.get("ECOA_DISTRIBUTED_DEBUG_TARGET_DIR", os.getcwd()),',
+        '    "client_container": os.environ.get("ECOA_DISTRIBUTED_DEBUG_CLIENT_CONTAINER", "code-server"),',
+        '}',
+        "",
+        f'if "{method}" == "GET":',
+        '    query = urllib.parse.urlencode(payload)',
+        f'    request = urllib.request.Request(f"{{api_base_url}}{endpoint}?{{query}}", method="GET")',
+        "else:",
+        '    body = json.dumps(payload).encode("utf-8")',
+        f'    request = urllib.request.Request(f"{{api_base_url}}{endpoint}", data=body, headers={{"Content-Type": "application/json"}}, method="{method}")',
+        "",
+        "try:",
+        "    with urllib.request.urlopen(request) as response:",
+        '        sys.stdout.write(response.read().decode("utf-8"))',
+        '        sys.stdout.write("\\n")',
+        "except urllib.error.HTTPError as exc:",
+        '    error_body = exc.read().decode("utf-8", errors="replace")',
+        '    sys.stderr.write(error_body or str(exc))',
+        '    sys.stderr.write("\\n")',
+        "    raise",
+        "PY",
         "",
     ]
-
-    for process in topology.processes:
-        lines.extend(
-            [
-                f"docker compose -f .vscode/distributed-debug.compose.yml exec -T {process.service_name} bash -lc \\",
-                f"  \"mkdir -p {binary_dir}/../logs && cd {binary_dir} && nohup gdbserver 0.0.0.0:{process.port} ./{process.name} > ../logs/{process.name}.gdbserver.log 2>&1 &\"",
-                "",
-            ]
-        )
-
     return "\n".join(lines).strip() + "\n"
 
 
+def _start_script() -> str:
+    return _api_script("/api/distributed-debug/start")
+
+
 def _stop_script() -> str:
-    return "\n".join(
-        [
-            "#!/usr/bin/env bash",
-            "set -euo pipefail",
-            "",
-            "docker compose -f .vscode/distributed-debug.compose.yml down",
-            "",
-        ]
-    )
+    return _api_script("/api/distributed-debug/stop")
+
+
+def _status_script() -> str:
+    return _api_script("/api/distributed-debug/status", method="GET")
 
 
 def _write_executable(path: Path, content: str) -> None:
@@ -299,7 +501,7 @@ def _write_executable(path: Path, content: str) -> None:
     path.chmod(path.stat().st_mode | stat.S_IEXEC)
 
 
-def write_distributed_debug_assets(target_dir: str, build_dir: str, topology: Optional[DebugTopology]) -> Dict[str, str]:
+def write_distributed_debug_launch_json(target_dir: str, build_dir: str, topology: Optional[DebugTopology]) -> str:
     target_path = Path(target_dir)
     vscode_dir = target_path / ".vscode"
     vscode_dir.mkdir(parents=True, exist_ok=True)
@@ -329,8 +531,15 @@ def write_distributed_debug_assets(target_dir: str, build_dir: str, topology: Op
         ),
         encoding="utf-8",
     )
+    return str(launch_json_path)
 
-    result = {"launch_json": str(launch_json_path)}
+
+def write_distributed_debug_assets(target_dir: str, build_dir: str, topology: Optional[DebugTopology]) -> Dict[str, str]:
+    target_path = Path(target_dir)
+    vscode_dir = target_path / ".vscode"
+    vscode_dir.mkdir(parents=True, exist_ok=True)
+
+    result = {"launch_json": write_distributed_debug_launch_json(target_dir, build_dir, topology)}
 
     if not topology or not topology.is_distributed:
         return result
@@ -338,16 +547,19 @@ def write_distributed_debug_assets(target_dir: str, build_dir: str, topology: Op
     compose_path = vscode_dir / COMPOSE_FILENAME
     start_script_path = vscode_dir / START_SCRIPT_FILENAME
     stop_script_path = vscode_dir / STOP_SCRIPT_FILENAME
+    status_script_path = vscode_dir / STATUS_SCRIPT_FILENAME
 
-    compose_path.write_text(_compose_yaml(build_dir, topology), encoding="utf-8")
-    _write_executable(start_script_path, _start_script(build_dir, topology))
+    compose_path.write_text(render_distributed_debug_compose(build_dir, topology), encoding="utf-8")
+    _write_executable(start_script_path, _start_script())
     _write_executable(stop_script_path, _stop_script())
+    _write_executable(status_script_path, _status_script())
 
     result.update(
         {
             "docker_compose": str(compose_path),
             "start_script": str(start_script_path),
             "stop_script": str(stop_script_path),
+            "status_script": str(status_script_path),
         }
     )
     return result

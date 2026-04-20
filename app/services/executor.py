@@ -189,7 +189,8 @@ class ToolExecutor:
         project_name: str,
         build_dir: str,
         cmake_dir: str,
-        workspace_dir: str = None
+        workspace_dir: str = None,
+        project_file: str = None,
     ) -> None:
         """
         Create VSCode launch.json configuration for the project.
@@ -207,7 +208,7 @@ class ToolExecutor:
 
         # Provide a target directory for .vscode (use workspace_dir if provided, else project_path)
         target_dir = workspace_dir if workspace_dir else project_path
-        topology = collect_debug_topology(project_path=project_path, build_dir=build_dir)
+        topology = collect_debug_topology(project_path=project_path, build_dir=build_dir, project_file=project_file)
         assets = write_distributed_debug_assets(target_dir=target_dir, build_dir=build_dir, topology=topology)
         logger.info(f"Created VSCode launch.json at: {assets['launch_json']}")
 
@@ -277,7 +278,12 @@ class ToolExecutor:
         else:
             return f'Tool {tool_id} execution failed with code {return_code}'
 
-    def _find_cmakelists_dir(self, project_path: str) -> str:
+    def _find_cmakelists_dir(
+        self,
+        project_path: str,
+        project_file: str = None,
+        tool_id: str = None,
+    ) -> str:
         """
         Find directory containing CMakeLists.txt in project.
 
@@ -290,6 +296,15 @@ class ToolExecutor:
         Raises:
             FileNotFoundError: If CMakeLists.txt not found
         """
+        is_harness_project = bool(project_file and "harness" in project_file.lower())
+        if tool_id == "ldp" and is_harness_project:
+            platform_candidate = os.path.join(project_path, "6-output", "platform")
+            if os.path.exists(os.path.join(platform_candidate, "CMakeLists.txt")):
+                return platform_candidate
+            platform_candidate = os.path.join(project_path, "6-Output", "platform")
+            if os.path.exists(os.path.join(platform_candidate, "CMakeLists.txt")):
+                return platform_candidate
+
         # Common output directory names
         common_output_dirs = ["6-output", "6-Output", "Output", "output", "build-output"]
 
@@ -313,6 +328,115 @@ class ToolExecutor:
                 return root
 
         raise FileNotFoundError(f"CMakeLists.txt not found in project: {project_path}")
+
+    def _prepare_harness_platform_wrapper(self, platform_dir: str) -> str:
+        """Create a wrapper CMake project so harness platform targets can be built standalone."""
+        platform_path = Path(platform_dir)
+        output_root = platform_path.parent
+        wrapper_dir = platform_path / ".distributed-debug-wrapper"
+        wrapper_dir.mkdir(parents=True, exist_ok=True)
+        types_shim_dir = wrapper_dir / "types-shim"
+        if types_shim_dir.exists():
+            shutil.rmtree(types_shim_dir)
+        types_shim_dir.mkdir(parents=True, exist_ok=True)
+
+        for header_source_dir in [
+            output_root / "0-Types" / "inc",
+            output_root / "0-Types" / "inc-gen",
+            output_root.parent / "0-Types" / "inc",
+            output_root.parent / "0-Types" / "inc-gen",
+        ]:
+            if not header_source_dir.exists():
+                continue
+            for header_path in header_source_dir.glob("*.h"):
+                if header_path.name == "ECOA.h":
+                    continue
+                shutil.copy2(header_path, types_shim_dir / header_path.name)
+
+        component_dirs = []
+        for child in sorted(output_root.iterdir()):
+            if not child.is_dir():
+                continue
+            if child.name in {"build", "platform", "0-Types", "src"}:
+                continue
+            if not (child / "CMakeLists.txt").exists():
+                continue
+            component_dirs.append(child.name)
+
+        platform_cmake = (platform_path / "CMakeLists.txt").read_text(encoding="utf-8")
+        executable_targets = []
+        for line in platform_cmake.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("add_executable("):
+                continue
+            remainder = stripped[len("add_executable("):]
+            target_name = remainder.split()[0].rstrip(")")
+            if target_name:
+                executable_targets.append(target_name)
+
+        lines = [
+            "cmake_minimum_required(VERSION 3.4)",
+            "project(harness_platform_wrapper)",
+            "",
+            "find_path(APR_INCLUDE_DIR apr_poll.h",
+            '  PATHS "${APR_DIR}/include/apr-1.0" "${APR_DIR}/include/apr-1" "${APR_DIR}/include" "/usr/include/apr-1.0" "/usr/include/apr-1" "/usr/include"',
+            ")",
+            "if(APR_INCLUDE_DIR)",
+            '  include_directories("${APR_INCLUDE_DIR}")',
+            '  set(APR_INCLUDE_DIR "${APR_INCLUDE_DIR}" CACHE PATH "" FORCE)',
+            '  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -I${APR_INCLUDE_DIR}")',
+            '  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -I${APR_INCLUDE_DIR}")',
+            "endif()",
+            "find_package(Threads REQUIRED)",
+            "if(NOT TARGET log4cplus::log4cplus)",
+            "  find_library(LOG4CPLUS_LIBRARY NAMES log4cplus REQUIRED)",
+            "  add_library(log4cplus::log4cplus SHARED IMPORTED)",
+            '  set_target_properties(log4cplus::log4cplus PROPERTIES IMPORTED_LOCATION "${LOG4CPLUS_LIBRARY}")',
+            "endif()",
+            "",
+            'add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/../lib" platform_lib)',
+        ]
+
+        for component_dir in component_dirs:
+            lines.append(
+                f'add_subdirectory("${{CMAKE_CURRENT_LIST_DIR}}/../../{component_dir}" {component_dir})'
+            )
+            lines.extend(
+                [
+                    f"if(TARGET lib_{component_dir})",
+                    f'  target_include_directories(lib_{component_dir} PRIVATE "${{CMAKE_CURRENT_LIST_DIR}}/types-shim")',
+                    "endif()",
+                ]
+            )
+
+        lines.extend(
+            [
+                'add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/.." generated_platform)',
+                "",
+            ]
+        )
+
+        for target_name in executable_targets:
+            lines.extend(
+                [
+                    f"if(TARGET {target_name})",
+                    f'  target_include_directories({target_name} PRIVATE "${{CMAKE_CURRENT_LIST_DIR}}/../svc_deserial" "${{CMAKE_CURRENT_LIST_DIR}}/types-shim")',
+                    f'  set_target_properties({target_name} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${{CMAKE_BINARY_DIR}}/bin")',
+                    "endif()",
+                ]
+            )
+
+        lines.extend(
+            [
+                "if(TARGET ecoa)",
+                '  set_target_properties(ecoa PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")',
+                "endif()",
+                "",
+            ]
+        )
+
+        (wrapper_dir / "CMakeLists.txt").write_text("\n".join(lines), encoding="utf-8")
+        return str(wrapper_dir)
 
     def _get_pkg_config_path(self, package: str) -> str:
         """
@@ -375,6 +499,7 @@ class ToolExecutor:
     def compile_project(
         self,
         project_path: str,
+        project_file: str = None,
         log_library: str = "log4cplus",
         cmake_options: List[str] = None,
         timeout: int = 600,
@@ -395,12 +520,23 @@ class ToolExecutor:
         """
         try:
             # Find CMakeLists.txt directory
-            cmake_dir = self._find_cmakelists_dir(project_path)
+            cmake_dir = self._find_cmakelists_dir(
+                project_path,
+                project_file=project_file,
+                tool_id=tool_id,
+            )
             logger.info(f"Compiling in directory: {cmake_dir}")
 
             # Build compile commands
             build_dir = os.path.join(cmake_dir, "build")
             os.makedirs(build_dir, exist_ok=True)
+            cmake_source_dir = cmake_dir
+            if tool_id == "ldp" and project_file and "harness" in project_file.lower():
+                cmake_source_dir = self._prepare_harness_platform_wrapper(cmake_dir)
+                cmake_cache_path = os.path.join(build_dir, "CMakeCache.txt")
+                if os.path.exists(cmake_cache_path):
+                    shutil.rmtree(build_dir)
+                    os.makedirs(build_dir, exist_ok=True)
 
             # Get dependency paths using pkg-config (NixOS style)
             try:
@@ -484,7 +620,7 @@ class ToolExecutor:
                     f"-DCUNIT_DIR={cunit_dir}",
                     f"-DLDP_LOG_USE={log_library}",
                     "-B", build_dir,
-                    "-S", cmake_dir
+                    "-S", cmake_source_dir
                 ]
 
                 # Add cmake_config.cmake if found
@@ -838,14 +974,19 @@ class ToolExecutor:
                 # Always generate VSCode launch.json for LDP on success, regardless of compilation
                 if tool_id == 'ldp':
                     try:
-                        cmake_dir = self._find_cmakelists_dir(project_path)
+                        cmake_dir = self._find_cmakelists_dir(
+                            project_path,
+                            project_file=project_file,
+                            tool_id=tool_id,
+                        )
                         build_dir = os.path.join(cmake_dir, "build")
                         self._create_vscode_launch_config(
                             project_path=project_path,
                             project_name=project_name,
                             build_dir=build_dir,
                             cmake_dir=cmake_dir,
-                            workspace_dir=workspace_dir
+                            workspace_dir=workspace_dir,
+                            project_file=project_file,
                         )
                     except Exception as e:
                         logger.warning(f"Failed to create launch.json for LDP: {e}")
@@ -881,6 +1022,7 @@ class ToolExecutor:
                     logger.info(f"Starting compilation with log_library={log_library}")
                     compile_result = self.compile_project(
                         project_path=project_path,
+                        project_file=project_file,
                         log_library=log_library,
                         cmake_options=cmake_options,
                         timeout=timeout,
