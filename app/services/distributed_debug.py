@@ -15,6 +15,8 @@ COMPOSE_FILENAME = "distributed-debug.compose.yml"
 START_SCRIPT_FILENAME = "start-distributed-debug.sh"
 STOP_SCRIPT_FILENAME = "stop-distributed-debug.sh"
 STATUS_SCRIPT_FILENAME = "status-distributed-debug.sh"
+COMPILE_SCRIPT_FILENAME = "compile.sh"
+README_FILENAME = "readme.md"
 CONTAINER_PROJECT_ROOT = "/workspace/project"
 
 
@@ -534,14 +536,390 @@ def write_distributed_debug_launch_json(target_dir: str, build_dir: str, topolog
     return str(launch_json_path)
 
 
-def write_distributed_debug_assets(target_dir: str, build_dir: str, topology: Optional[DebugTopology]) -> Dict[str, str]:
+def _pkg_config_path_bash(package: str) -> str:
+    """Return a bash snippet that resolves a package install prefix via pkg-config."""
+    return (
+        f'_pkg_config_path "{package}"'
+    )
+
+
+def _compile_script_content(build_dir: str, cmake_dir: str, project_file: Optional[str]) -> str:
+    """Generate the content of .vscode/compile.sh.
+
+    The script auto-detects harness vs integration mode and uses pkg-config
+    to resolve dependency paths at runtime.
+    """
+    is_harness = bool(project_file and "harness" in project_file.lower())
+
+    # Compute relative paths from project root (parent of .vscode) to cmake_dir and build_dir
+    # These are used as hints in the script; the script itself recalculates them.
+    cmake_dir_name = Path(cmake_dir).name  # e.g. "6-output" or "platform"
+    cmake_parent_name = Path(cmake_dir).parent.name  # e.g. "6-output" when cmake_dir is platform
+
+    lines = [
+        "#!/usr/bin/env bash",
+        "# ECOA LDP Compile Script - Auto-generated",
+        "# Usage: .vscode/compile.sh [log_library]",
+        "#   log_library: log4cplus (default), zlog, or lttng",
+        "set -euo pipefail",
+        "",
+        'LOG_LIBRARY="${1:-log4cplus}"',
+        'PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"',
+        "",
+        "# --- Helper: resolve package prefix via pkg-config ---",
+        "_pkg_config_path() {",
+        '    local pkg="$1"',
+        "    local result",
+        "",
+        '    # Method 1: parse from --cflags (most reliable on Ubuntu)',
+        '    result=$(pkg-config --cflags "$pkg" 2>/dev/null || true)',
+        '    if [ -n "$result" ]; then',
+        '        for part in $result; do',
+        '            if [[ "$part" == -I* ]]; then',
+        '                local path="${part#-I}"',
+        '                if [[ "$path" == *"/include"* ]]; then',
+        '                    path="${path%%/include*}"',
+        '                    if [ -n "$path" ]; then',
+        '                        echo "$path"',
+        '                        return 0',
+        '                    fi',
+        '                fi',
+        '            fi',
+        '        done',
+        '    fi',
+        "",
+        '    # Method 2: try --variable=prefix',
+        '    result=$(pkg-config --variable=prefix "$pkg" 2>/dev/null || true)',
+        '    if [ -n "$result" ]; then',
+        '        echo "$result"',
+        '        return 0',
+        '    fi',
+        "",
+        '    echo "ERROR: pkg-config failed for $pkg" >&2',
+        '    return 1',
+        "}",
+        "",
+        "# --- Detect harness vs integration mode ---",
+        'CMAKE_DIR=""',
+        'CMAKE_SOURCE_DIR=""',
+        'BUILD_DIR=""',
+        "",
+    ]
+
+    if is_harness:
+        lines.extend(
+            [
+                "# Harness mode: CMakeLists.txt is under 6-output/platform/",
+                'for _out_dir in "6-output" "6-Output"; do',
+                '    if [ -f "${PROJECT_DIR}/${_out_dir}/platform/CMakeLists.txt" ]; then',
+                '        CMAKE_DIR="${PROJECT_DIR}/${_out_dir}/platform"',
+                '        break',
+                '    fi',
+                'done',
+                'if [ -z "$CMAKE_DIR" ]; then',
+                '    echo "ERROR: CMakeLists.txt not found in platform directory" >&2',
+                '    exit 1',
+                'fi',
+                "",
+                '# Harness uses the wrapper as cmake source',
+                'CMAKE_SOURCE_DIR="${CMAKE_DIR}/.distributed-debug-wrapper"',
+                'BUILD_DIR="${CMAKE_DIR}/build"',
+                "",
+                '# Harness: clear build dir if CMakeCache exists (wrapper may have changed)',
+                'if [ -f "${BUILD_DIR}/CMakeCache.txt" ]; then',
+                '    echo "Clearing build directory (CMakeCache.txt exists)..."',
+                '    rm -rf "${BUILD_DIR}"',
+                'fi',
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "# Integration mode: CMakeLists.txt is under 6-output/ (or similar)",
+                'for _out_dir in "6-output" "6-Output" "Output" "output" "build-output"; do',
+                '    if [ -f "${PROJECT_DIR}/${_out_dir}/CMakeLists.txt" ]; then',
+                '        CMAKE_DIR="${PROJECT_DIR}/${_out_dir}"',
+                '        break',
+                '    fi',
+                'done',
+                'if [ -z "$CMAKE_DIR" ]; then',
+                '    echo "ERROR: CMakeLists.txt not found" >&2',
+                '    exit 1',
+                'fi',
+                "",
+                'CMAKE_SOURCE_DIR="${CMAKE_DIR}"',
+                'BUILD_DIR="${CMAKE_DIR}/build"',
+            ]
+        )
+
+    lines.extend(
+        [
+            "",
+            'mkdir -p "${BUILD_DIR}"',
+            "",
+            "# --- Resolve dependencies via pkg-config ---",
+            'APR_DIR=$(_pkg_config_path "apr-1")',
+            'LOG4CPLUS_DIR=$(_pkg_config_path "log4cplus")',
+            'CUNIT_DIR=$(_pkg_config_path "cunit")',
+            "",
+            "# --- Find cmake_config.cmake ---",
+            'CMAKE_CONFIG_ARG=""',
+            'if [ -f "${CMAKE_DIR}/cmake_config.cmake" ]; then',
+            '    CMAKE_CONFIG_ARG="-C ${CMAKE_DIR}/cmake_config.cmake"',
+            'elif [ -f "${PROJECT_DIR}/cmake_config.cmake" ]; then',
+            '    CMAKE_CONFIG_ARG="-C ${PROJECT_DIR}/cmake_config.cmake"',
+            'fi',
+            "",
+            "# --- Run CMake ---",
+            'echo "=== Running CMake (mode: ' + ('harness' if is_harness else 'integration') + ', log: ${LOG_LIBRARY}) ==="',
+            'cmake \\',
+            '    -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \\',
+            '    -DAPR_DIR="${APR_DIR}" \\',
+            '    -DLOG4CPLUS_DIR="${LOG4CPLUS_DIR}" \\',
+            '    -DCUNIT_DIR="${CUNIT_DIR}" \\',
+            '    -DLDP_LOG_USE="${LOG_LIBRARY}" \\',
+            '    -B "${BUILD_DIR}" \\',
+            '    -S "${CMAKE_SOURCE_DIR}" \\',
+            '    ${CMAKE_CONFIG_ARG}',
+            "",
+            "# --- Run Make ---",
+            'echo "=== Running Make ==="',
+            'make --no-print-directory -C "${BUILD_DIR}" all',
+            "",
+            'echo "=== Build complete ==="',
+        ]
+    )
+
+    return "\n".join(lines) + "\n"
+
+
+def write_compile_script(target_dir: str, build_dir: str, cmake_dir: str, project_file: Optional[str] = None) -> str:
+    """Write .vscode/compile.sh for recompiling the LDP project.
+
+    The script auto-detects harness vs integration mode and resolves
+    dependency paths via pkg-config at runtime.
+
+    Args:
+        target_dir: Directory where .vscode/ will be created
+        build_dir: Build directory path (e.g. .../6-output/build or .../6-output/platform/build)
+        cmake_dir: CMake source directory path
+        project_file: Project file name (used to detect harness mode)
+
+    Returns:
+        Path to the generated compile.sh script
+    """
+    target_path = Path(target_dir)
+    vscode_dir = target_path / ".vscode"
+    vscode_dir.mkdir(parents=True, exist_ok=True)
+
+    compile_script_path = vscode_dir / COMPILE_SCRIPT_FILENAME
+    content = _compile_script_content(build_dir, cmake_dir, project_file)
+    _write_executable(compile_script_path, content)
+
+    return str(compile_script_path)
+
+
+def _vscode_readme_content(has_compile_script: bool, has_distributed_debug: bool, is_harness: bool = False) -> str:
+    """Generate the content of the readme.md explaining .vscode scripts."""
+    lines = [
+        "# .vscode 脚本使用说明",
+        "",
+        "本目录下的 `.vscode` 文件夹包含由 ECOA LDP 工具自动生成的辅助脚本和配置文件，",
+        "用于项目编译和分布式调试。",
+        "",
+        "---",
+        "",
+    ]
+
+    if has_compile_script:
+        mode_desc = "**Harness 模式**" if is_harness else "**Integration 模式**"
+        lines.extend(
+            [
+                "## 编译脚本",
+                "",
+                f"### `.vscode/compile.sh` — 重新编译项目",
+                "",
+                f"当前项目为" + mode_desc + "，脚本已针对该模式进行配置。",
+                "",
+                "**用法：**",
+                "",
+                "```bash",
+                "# 使用默认日志库 (log4cplus) 编译",
+                ".vscode/compile.sh",
+                "",
+                "# 指定日志库编译 (支持: log4cplus, zlog, lttng)",
+                ".vscode/compile.sh zlog",
+                "```",
+                "",
+                "**脚本功能：**",
+                "",
+                "- 自动检测项目模式（Harness / Integration）",
+                "- 通过 `pkg-config` 动态查找依赖路径（log4cplus、apr-1、cunit）",
+                "- 查找 `cmake_config.cmake` 配置文件",
+                "- 执行 `cmake` 配置和 `make` 编译",
+                "",
+            ]
+        )
+
+        if is_harness:
+            lines.extend(
+                [
+                    "**Harness 模式特殊处理：**",
+                    "",
+                    "- CMakeLists.txt 位于 `6-output/platform/` 目录下",
+                    "- 使用 `.distributed-debug-wrapper` 作为 CMake 源目录",
+                    "- 当 `CMakeCache.txt` 存在时，自动清除 build 目录后重新配置",
+                    "",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "**Integration 模式说明：**",
+                    "",
+                    "- CMakeLists.txt 位于 `6-output/` 目录下",
+                    "- CMake 源目录与 CMakeLists.txt 所在目录相同",
+                    "",
+                ]
+            )
+
+        lines.extend(
+            [
+                "---",
+                "",
+            ]
+        )
+
+    if has_distributed_debug:
+        lines.extend(
+            [
+                "## 分布式调试脚本",
+                "",
+                "以下脚本用于多节点分布式 ECOA 应用的调试，通过 Docker Compose 启动调试容器，",
+                "并使用 gdbserver 远程调试各节点上的进程。",
+                "",
+                "### `.vscode/start-distributed-debug.sh` — 启动分布式调试环境",
+                "",
+                "```bash",
+                ".vscode/start-distributed-debug.sh",
+                "```",
+                "",
+                "启动 Docker Compose 服务，为每个计算节点创建调试容器，",
+                "并在容器内启动 gdbserver 等待调试连接。",
+                "",
+                "### `.vscode/stop-distributed-debug.sh` — 停止分布式调试环境",
+                "",
+                "```bash",
+                ".vscode/stop-distributed-debug.sh",
+                "```",
+                "",
+                "停止并移除所有调试容器和 Docker 网络。",
+                "",
+                "### `.vscode/status-distributed-debug.sh` — 查看调试状态",
+                "",
+                "```bash",
+                ".vscode/status-distributed-debug.sh",
+                "```",
+                "",
+                "查看当前分布式调试环境的运行状态，包括各容器和服务信息。",
+                "",
+                "### `.vscode/distributed-debug.compose.yml` — Docker Compose 配置",
+                "",
+                "Docker Compose 配置文件，定义了各节点的调试容器，包括镜像、网络和挂载。",
+                "此文件由工具自动生成，**请勿手动修改**。",
+                "",
+                "---",
+                "",
+                "## VS Code 调试配置",
+                "",
+                "### `.vscode/launch.json` — 调试启动配置",
+                "",
+                "包含以下调试配置：",
+                "",
+                "- **Debug platform** — 本地调试 platform 进程",
+                "- **Attach platform (main)** — 远程附加到主节点的 platform 进程",
+                "- **Attach PD_xxx (node)** — 远程附加到各保护域进程",
+                "- **Attach distributed ECOA** — 复合配置，同时附加所有分布式进程",
+                "",
+                "**使用步骤：**",
+                "",
+                "1. 运行 `start-distributed-debug.sh` 启动调试环境",
+                '2. 在 VS Code 中选择对应的调试配置（如 "Attach distributed ECOA"）',
+                "3. 按 F5 开始调试",
+                "",
+                "---",
+                "",
+            ]
+        )
+    elif has_compile_script:
+        lines.extend(
+            [
+                "## VS Code 调试配置",
+                "",
+                "### `.vscode/launch.json` — 调试启动配置",
+                "",
+                "包含本地调试配置：",
+                "",
+                "- **Debug platform** — 本地调试 platform 进程",
+                "",
+                "---",
+                "",
+            ]
+        )
+
+    lines.extend(
+        [
+            "## 注意事项",
+            "",
+            "- 以上所有文件由 ECOA LDP 工具自动生成，每次执行 LDP 时会覆盖更新",
+            "- 如需自定义修改，请在生成后手动调整（但下次 LDP 执行后会被覆盖）",
+            "- 编译脚本依赖 `pkg-config` 工具，请确保系统已安装",
+            "- 分布式调试脚本依赖 Docker 和 Docker Compose",
+            "",
+        ]
+    )
+
+    return "\n".join(lines)
+
+
+def write_vscode_readme(target_dir: str, has_compile_script: bool, has_distributed_debug: bool, is_harness: bool = False) -> str:
+    """Write readme.md in the target directory explaining .vscode scripts.
+
+    Args:
+        target_dir: Directory where readme.md will be created (project root, e.g. Steps/)
+        has_compile_script: Whether compile.sh was generated
+        has_distributed_debug: Whether distributed debug scripts were generated
+        is_harness: Whether the project is in harness mode
+
+    Returns:
+        Path to the generated readme.md
+    """
+    target_path = Path(target_dir)
+    readme_path = target_path / README_FILENAME
+    content = _vscode_readme_content(has_compile_script, has_distributed_debug, is_harness)
+    readme_path.write_text(content, encoding="utf-8")
+    return str(readme_path)
+
+
+def write_distributed_debug_assets(target_dir: str, build_dir: str, topology: Optional[DebugTopology], cmake_dir: Optional[str] = None, project_file: Optional[str] = None) -> Dict[str, str]:
     target_path = Path(target_dir)
     vscode_dir = target_path / ".vscode"
     vscode_dir.mkdir(parents=True, exist_ok=True)
 
     result = {"launch_json": write_distributed_debug_launch_json(target_dir, build_dir, topology)}
 
-    if not topology or not topology.is_distributed:
+    # Always generate compile.sh when cmake_dir is provided
+    has_compile_script = cmake_dir is not None
+    if has_compile_script:
+        compile_script_path = write_compile_script(target_dir, build_dir, cmake_dir, project_file)
+        result["compile_script"] = compile_script_path
+
+    has_distributed_debug = topology is not None and topology.is_distributed
+    if not has_distributed_debug:
+        # Generate readme even for non-distributed projects
+        is_harness = bool(project_file and "harness" in project_file.lower())
+        readme_path = write_vscode_readme(target_dir, has_compile_script, has_distributed_debug, is_harness)
+        result["readme"] = readme_path
         return result
 
     compose_path = vscode_dir / COMPOSE_FILENAME
@@ -553,6 +931,11 @@ def write_distributed_debug_assets(target_dir: str, build_dir: str, topology: Op
     _write_executable(start_script_path, _start_script())
     _write_executable(stop_script_path, _stop_script())
     _write_executable(status_script_path, _status_script())
+
+    # Generate readme for distributed debug projects
+    is_harness = bool(project_file and "harness" in project_file.lower())
+    readme_path = write_vscode_readme(target_dir, has_compile_script, has_distributed_debug, is_harness)
+    result["readme"] = readme_path
 
     result.update(
         {

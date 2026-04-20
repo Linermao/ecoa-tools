@@ -5,6 +5,7 @@ import subprocess
 import shutil
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+import time as _time
 from datetime import datetime
 
 from app.utils.config import get_config
@@ -135,7 +136,7 @@ class ToolExecutor:
             }
 
         except subprocess.TimeoutExpired:
-            logger.error(f"Tool execution timeout: {command}")
+            logger.error(f"[{tool_id.upper()}] Tool execution timeout: {command}")
             return {
                 'success': False,
                 'tool': tool_id,
@@ -148,7 +149,7 @@ class ToolExecutor:
                 'message': f'Tool execution timeout: {tool_id}'
             }
         except Exception as e:
-            logger.exception(f"Error executing tool: {e}")
+            logger.exception(f"[{tool_id.upper()}] Error executing tool: {e}")
             return {
                 'success': False,
                 'tool': tool_id,
@@ -209,10 +210,16 @@ class ToolExecutor:
         # Provide a target directory for .vscode (use workspace_dir if provided, else project_path)
         target_dir = workspace_dir if workspace_dir else project_path
         topology = collect_debug_topology(project_path=project_path, build_dir=build_dir, project_file=project_file)
-        assets = write_distributed_debug_assets(target_dir=target_dir, build_dir=build_dir, topology=topology)
-        logger.info(f"Created VSCode launch.json at: {assets['launch_json']}")
-
-
+        assets = write_distributed_debug_assets(
+            target_dir=target_dir,
+            build_dir=build_dir,
+            topology=topology,
+            cmake_dir=cmake_dir,
+            project_file=project_file,
+        )
+        logger.info(f"[LDP] Created VSCode launch.json at: {assets['launch_json']}")
+        if "compile_script" in assets:
+            logger.info(f"[LDP] Created compile script at: {assets['compile_script']}")
 
     def _should_compile(self, compile_flag: Optional[bool], compile_config: Dict) -> bool:
         """
@@ -525,7 +532,7 @@ class ToolExecutor:
                 project_file=project_file,
                 tool_id=tool_id,
             )
-            logger.info(f"Compiling in directory: {cmake_dir}")
+            logger.info(f"[{tool_id.upper()}][COMPILE] Compiling in directory: {cmake_dir}")
 
             # Build compile commands
             build_dir = os.path.join(cmake_dir, "build")
@@ -543,7 +550,7 @@ class ToolExecutor:
                 log4cplus_dir = self._get_pkg_config_path("log4cplus")
                 apr_dir = self._get_pkg_config_path("apr-1")
                 cunit_dir = self._get_pkg_config_path("cunit")
-                logger.info(f"Using pkg-config paths: log4cplus={log4cplus_dir}, apr={apr_dir}, cunit={cunit_dir}")
+                logger.info(f"[{tool_id.upper()}][COMPILE] Using pkg-config paths: log4cplus={log4cplus_dir}, apr={apr_dir}, cunit={cunit_dir}")
             except FileNotFoundError as e:
                 logger.warning(f"Failed to get pkg-config paths: {e}")
                 raise
@@ -639,7 +646,7 @@ class ToolExecutor:
             # Check if compilation already done
             platform_executable = os.path.join(build_dir, "bin", "platform")
             if os.path.exists(platform_executable) and os.access(platform_executable, os.X_OK):
-                logger.info(f"Compilation skipped: {platform_executable} already exists")
+                logger.info(f"[{tool_id.upper()}][COMPILE] Compilation skipped: {platform_executable} already exists")
                 return {
                     "compile_success": True,
                     "compile_stdout": f"{platform_executable} already exists. Compilation bypassed.",
@@ -653,7 +660,8 @@ class ToolExecutor:
                 }
 
             # Execute CMake
-            logger.info(f"Running CMake: {' '.join(cmake_cmd)}")
+            logger.info(f"[{tool_id.upper()}][COMPILE] Running CMake: {' '.join(cmake_cmd)}")
+            cmake_start = _time.monotonic()
 
             if tool_id == "csmgvt":
                 # For csmgvt, run cmake from build directory with ".." argument
@@ -674,7 +682,9 @@ class ToolExecutor:
                     timeout=timeout
                 )
 
+            cmake_elapsed = _time.monotonic() - cmake_start
             cmake_success = cmake_result.returncode == 0
+            logger.info(f"[{tool_id.upper()}][COMPILE] CMake %s in %.1fs", "succeeded" if cmake_success else "failed", cmake_elapsed)
 
             # Build make command
             make_cmd = [
@@ -687,13 +697,16 @@ class ToolExecutor:
             # Execute make only if CMake succeeded
             make_result = None
             if cmake_success:
-                logger.info(f"Running make {' '.join(make_cmd)}")
+                logger.info(f"[{tool_id.upper()}][COMPILE] Running make {' '.join(make_cmd)}")
+                make_start = _time.monotonic()
                 make_result = subprocess.run(
                     make_cmd,
                     capture_output=True,
                     text=True,
                     timeout=timeout,
                 )
+                make_elapsed = _time.monotonic() - make_start
+                logger.info(f"[{tool_id.upper()}][COMPILE] Make %s in %.1fs", "succeeded" if make_result.returncode == 0 else "failed", make_elapsed)
             else:
                 # Create dummy make result for consistency
                 make_result = subprocess.CompletedProcess(
@@ -743,7 +756,7 @@ class ToolExecutor:
             }
 
         except subprocess.TimeoutExpired:
-            logger.error(f"Compilation timeout in project: {project_path}")
+            logger.error(f"[{tool_id.upper()}][COMPILE] Compilation timeout in project: {project_path}")
             return {
                 "compile_success": False,
                 "compile_stdout": "",
@@ -756,7 +769,7 @@ class ToolExecutor:
                 "make_command": ""
             }
         except FileNotFoundError as e:
-            logger.error(f"CMakeLists.txt not found: {e}")
+            logger.error(f"[COMPILE] CMakeLists.txt not found: {e}")
             return {
                 "compile_success": False,
                 "compile_stdout": "",
@@ -769,7 +782,7 @@ class ToolExecutor:
                 "make_command": ""
             }
         except Exception as e:
-            logger.exception(f"Unexpected compilation error: {e}")
+            logger.exception(f"[COMPILE] Unexpected compilation error: {e}")
             return {
                 "compile_success": False,
                 "compile_stdout": "",
@@ -948,7 +961,7 @@ class ToolExecutor:
         if additional_args:
             cmd.extend(additional_args)
 
-        logger.info(f"Executing tool '{tool_id}' in project '{project_name}'")
+        logger.info(f"[{tool_id.upper()}] Executing tool in project '{project_name}'")
         logger.debug(f"Command: {' '.join(cmd)}")
         logger.debug(f"Working directory: {project_path}")
 
@@ -969,7 +982,7 @@ class ToolExecutor:
             if success:
                 output_types = tool_config.get('output_types', [])
                 generated_files = self._find_output_files(project_path, output_types)
-                logger.info(f"Found {len(generated_files)} generated files")
+                logger.info(f"[{tool_id.upper()}] Found {len(generated_files)} generated files")
 
                 # Always generate VSCode launch.json for LDP on success, regardless of compilation
                 if tool_id == 'ldp':
@@ -989,7 +1002,7 @@ class ToolExecutor:
                             project_file=project_file,
                         )
                     except Exception as e:
-                        logger.warning(f"Failed to create launch.json for LDP: {e}")
+                        logger.warning(f"[LDP] Failed to create launch.json: {e}")
 
             # Compile project if tool is ldp or csmgvt and compilation is enabled
             compile_result = {}
@@ -1019,7 +1032,7 @@ class ToolExecutor:
                     # Determine timeout
                     timeout = compile_config.get('timeout', 600)
 
-                    logger.info(f"Starting compilation with log_library={log_library}")
+                    logger.info(f"[{tool_id.upper()}][COMPILE] Starting compilation with log_library={log_library}")
                     compile_result = self.compile_project(
                         project_path=project_path,
                         project_file=project_file,
@@ -1028,9 +1041,9 @@ class ToolExecutor:
                         timeout=timeout,
                         tool_id=tool_id
                     )
-                    logger.info(f"Compilation {'succeeded' if compile_result.get('compile_success') else 'failed'}")
+                    logger.info(f"[{tool_id.upper()}][COMPILE] Compilation {'succeeded' if compile_result.get('compile_success') else 'failed'}")
                 else:
-                    logger.info(f"Compilation skipped for tool {tool_id} (compile={compile}, config.enabled={compile_config.get('enabled', False)})")
+                    logger.info(f"[{tool_id.upper()}][COMPILE] Compilation skipped (compile={compile}, config.enabled={compile_config.get('enabled', False)})")
 
             # Prepare result dictionary
             result_dict = {

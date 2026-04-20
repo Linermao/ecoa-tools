@@ -161,8 +161,8 @@ def _resolve_project_file(project_id: str, workspace_id: str, skip_export: bool,
                     "subStatus": "NONE",
                     "progress": 0,
                     "logs": [
-                        "[ERROR] Existing workspace does not contain an exported ECOA project XML file.",
-                        f"[ERROR] Expected under: {steps_root}",
+                        "[EXPORT][ERROR] Existing workspace does not contain an exported ECOA project XML file.",
+                        f"[EXPORT][ERROR] Expected under: {steps_root}",
                     ],
                 },
                 task_id,
@@ -177,8 +177,8 @@ def _resolve_project_file(project_id: str, workspace_id: str, skip_export: bool,
                 "subStatus": "NONE",
                 "progress": 5,
                 "logs": [
-                    "[ECOA-WEB] Reusing the existing exported workspace to preserve business code edits.",
-                    f"[ECOA-WEB] Reused project file: {steps_root / project_file}",
+                    "[EXPORT][WARN] Reusing the existing exported workspace to preserve business code edits.",
+                    f"[EXPORT][INFO] Reused project file: {steps_root / project_file}",
                 ],
             },
             task_id,
@@ -191,7 +191,7 @@ def _resolve_project_file(project_id: str, workspace_id: str, skip_export: bool,
             "status": "EXPORTING_XML",
             "subStatus": "NONE",
             "progress": 0,
-            "logs": ["[ECOA-WEB] Exporting ECOA XML from EDT into the shared workspace..."],
+            "logs": ["[EXPORT][INFO] Exporting ECOA XML from EDT into the shared workspace..."],
         },
         task_id,
     )
@@ -205,8 +205,8 @@ def _resolve_project_file(project_id: str, workspace_id: str, skip_export: bool,
                 "subStatus": "NONE",
                 "progress": 0,
                 "logs": [
-                    f"[ERROR] Failed to export ECOA XML: {export_err}",
-                    "[ERROR] Please check whether the sirius-web backend is reachable.",
+                    f"[EXPORT][ERROR] Failed to export ECOA XML: {export_err}",
+                    "[EXPORT][ERROR] Please check whether the sirius-web backend is reachable.",
                 ],
             },
             task_id,
@@ -220,8 +220,8 @@ def _resolve_project_file(project_id: str, workspace_id: str, skip_export: bool,
             "subStatus": "NONE",
             "progress": 5,
             "logs": [
-                f"[ECOA-WEB] Exported project descriptor: {project_name}/{project_file}",
-                f"[ECOA-WEB] Workspace path: {steps_root / project_file}",
+                f"[EXPORT][SUCCESS] Exported project descriptor: {project_name}/{project_file}",
+                f"[EXPORT][INFO] Workspace path: {steps_root / project_file}",
             ],
         },
         task_id,
@@ -229,26 +229,141 @@ def _resolve_project_file(project_id: str, workspace_id: str, skip_export: bool,
     return project_name, project_file, steps_root
 
 
+def _classify_line(line: str) -> str:
+    """Classify a log line into INFO, WARN, or ERROR based on content."""
+    lower = line.lower()
+    if any(kw in lower for kw in ("error", "fatal", "failed", "failure", "undefined reference", "no such file")):
+        return "ERROR"
+    if any(kw in lower for kw in ("warning", "warn", "deprecated")):
+        return "WARN"
+    return "INFO"
+
+
+def _summarize_compile_logs(tool_id: str, compile_stdout: str, compile_stderr: str) -> list[str]:
+    """Extract key summary lines from cmake/make output instead of forwarding raw output.
+
+    Returns log lines in [PHASE][COMPILE][LEVEL] format with:
+    - CMake configuration summary
+    - Make build summary (built targets)
+    - Error lines from both cmake and make stderr
+    - Truncated if too many error lines (>20)
+    """
+    phase = tool_id.upper()
+    summary: list[str] = []
+    max_errors = 20
+
+    # --- CMake section ---
+    cmake_key_lines = []
+    cmake_done = False
+    for line in compile_stdout.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if any(marker in stripped for marker in (
+            "-- Configuring done",
+            "-- Generating done",
+            "-- Build files have been written",
+            "-- The CXX compiler identification",
+            "-- Check for working CXX compiler",
+        )):
+            cmake_key_lines.append(stripped)
+        if stripped.startswith("-- Configuring done"):
+            cmake_done = True
+
+    if cmake_key_lines or compile_stderr:
+        summary.append(f"[{phase}][COMPILE][INFO] === CMake Configuration ===")
+        for kl in cmake_key_lines:
+            summary.append(f"[{phase}][COMPILE][INFO] {kl}")
+        if not cmake_done and compile_stderr:
+            summary.append(f"[{phase}][COMPILE][ERROR] CMake configuration failed")
+
+    # --- Make section ---
+    built_targets = []
+    for line in compile_stdout.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("Built target") or stripped.startswith("Linking"):
+            built_targets.append(stripped)
+        # Skip the CMake section already handled above
+        if stripped.startswith("--"):
+            continue
+
+    if built_targets:
+        summary.append(f"[{phase}][COMPILE][INFO] === Make Build ===")
+        for bt in built_targets:
+            summary.append(f"[{phase}][COMPILE][INFO] {bt}")
+
+    # --- Error lines from stderr ---
+    error_lines = []
+    for line in compile_stderr.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        level = _classify_line(stripped)
+        if level == "ERROR":
+            error_lines.append(stripped)
+
+    if error_lines:
+        summary.append(f"[{phase}][COMPILE][INFO] === Build Errors ===")
+        for el in error_lines[:max_errors]:
+            summary.append(f"[{phase}][COMPILE][ERROR] {el}")
+        remaining = len(error_lines) - max_errors
+        if remaining > 0:
+            summary.append(f"[{phase}][COMPILE][WARN] ... and {remaining} more errors (truncated)")
+
+    # If nothing was extracted but there was output, add a minimal note
+    if not summary and (compile_stdout.strip() or compile_stderr.strip()):
+        summary.append(f"[{phase}][COMPILE][INFO] Build output produced (see backend logs for details)")
+
+    return summary
+
+
 def _build_tool_logs(tool_id: str, result: dict) -> list[str]:
-    """Normalize stdout/stderr/compile logs into callback log lines."""
+    """Normalize stdout/stderr/compile logs into callback log lines with [PHASE][LEVEL] format."""
+    phase = tool_id.upper()
     tool_logs: list[str] = []
 
+    # Tool stdout
     for line in (result.get("stdout") or "").splitlines():
         if line.strip():
-            tool_logs.append(f"[{tool_id.upper()}] {line}")
+            level = _classify_line(line)
+            tool_logs.append(f"[{phase}][{level}] {line}")
+
+    # Tool stderr
     for line in (result.get("stderr") or "").splitlines():
         if line.strip():
-            tool_logs.append(f"[{tool_id.upper()}] [STDERR] {line}")
-    for line in (result.get("compile_stdout") or "").splitlines():
-        if line.strip():
-            tool_logs.append(f"[{tool_id.upper()}] [COMPILE] {line}")
-    for line in (result.get("compile_stderr") or "").splitlines():
-        if line.strip():
-            tool_logs.append(f"[{tool_id.upper()}] [COMPILE_ERR] {line}")
+            level = _classify_line(line)
+            tool_logs.append(f"[{phase}][{level}] {line}")
 
+    # Compile logs — use summary instead of raw output
+    compile_stdout = result.get("compile_stdout") or ""
+    compile_stderr = result.get("compile_stderr") or ""
+    if compile_stdout.strip() or compile_stderr.strip():
+        tool_logs.extend(_summarize_compile_logs(tool_id, compile_stdout, compile_stderr))
+
+    # Generated files count
     gen_files = result.get("generated_files", [])
     if gen_files:
-        tool_logs.append(f"[{tool_id.upper()}] Generated files: {len(gen_files)}")
+        tool_logs.append(f"[{phase}][INFO] Generated files: {len(gen_files)}")
+
+    # Final status line
+    success = result.get("success", False) and result.get("return_code", 1) == 0
+    compile_success = result.get("compile_success")
+    if compile_success is not None:
+        if success and compile_success:
+            tool_logs.append(f"[{phase}][SUCCESS] Tool execution and compilation completed")
+        elif success and not compile_success:
+            tool_logs.append(f"[{phase}][ERROR] Tool executed successfully but compilation failed")
+        elif not success:
+            rc = result.get("return_code", -1)
+            tool_logs.append(f"[{phase}][ERROR] Tool execution failed (return_code={rc})")
+    else:
+        if success:
+            tool_logs.append(f"[{phase}][SUCCESS] Tool execution completed")
+        else:
+            rc = result.get("return_code", -1)
+            tool_logs.append(f"[{phase}][ERROR] Tool execution failed (return_code={rc})")
 
     return tool_logs
 
@@ -307,7 +422,7 @@ def _run_pipeline(
                 "status": "GENERATING",
                 "subStatus": sub_status,
                 "progress": p_start,
-                "logs": [f"{label} started."],
+                "logs": [f"[{phase_id}][INFO] {label} started."],
                 },
                 context,
             ),
@@ -339,7 +454,7 @@ def _run_pipeline(
                             "subStatus": sub_status,
                             "progress": p_end,
                             "outputPath": output_path,
-                            "logs": ["[ASCTG] [ERROR] Missing selected components or config.xml"],
+                            "logs": ["[ASCTG][ERROR] Missing selected components or config.xml"],
                             },
                             context,
                         ),
@@ -418,7 +533,7 @@ def _run_pipeline(
                             "subStatus": sub_status,
                             "progress": p_end,
                             "outputPath": output_path,
-                            "logs": [f"{label} [ERROR] {exc}"],
+                            "logs": [f"[{phase_id}][ERROR] {exc}"],
                             },
                             context,
                         ),
@@ -433,7 +548,7 @@ def _run_pipeline(
                     "status": "GENERATING",
                     "subStatus": sub_status,
                     "progress": p_end,
-                    "logs": [f"{label} completed successfully."],
+                    "logs": [f"[{phase_id}][SUCCESS] {label} completed successfully."],
                     },
                     context,
                 ),
@@ -444,13 +559,13 @@ def _run_pipeline(
         had_failure = True
         if not tool_success:
             rc = result.get("return_code", -1)
-            fail_logs = [f"{label} [ERROR] Tool execution failed (return_code={rc})"]
+            fail_logs = [f"[{phase_id}][ERROR] Tool execution failed (return_code={rc})"]
         else:
             rc = result.get("compile_return_code", -1)
-            fail_logs = [f"{label} [ERROR] Compilation failed (return_code={rc})"]
+            fail_logs = [f"[{phase_id}][COMPILE][ERROR] Compilation failed (return_code={rc})"]
 
         if continue_on_error:
-            fail_logs.append(f"[WARN] continueOnError=true, continuing after {tool_id} failure.")
+            fail_logs.append(f"[{phase_id}][WARN] continueOnError=true, continuing after {tool_id} failure.")
             _send_callback(
                 callback_url,
                 _callback_payload(
@@ -485,16 +600,16 @@ def _run_pipeline(
     status = "AWAITING_CODE" if should_await_code(mode, selected_phases, had_failure, continuing) else "COMPLETED"
     if status == "AWAITING_CODE":
         final_logs = [
-            "Skeleton generation finished.",
-            "Open Code Server, add your business code, then continue with CSMGVT or LDP.",
+            "[PIPELINE][INFO] Skeleton generation finished.",
+            "[PIPELINE][INFO] Open Code Server, add your business code, then continue with CSMGVT or LDP.",
         ]
     else:
         final_logs = [
-            "ECOA generation finished.",
-            f"[SUCCESS] Output path: {output_path}",
+            "[PIPELINE][SUCCESS] ECOA generation finished.",
+            f"[PIPELINE][INFO] Output path: {output_path}",
         ]
         if had_failure and continue_on_error:
-            final_logs.append("[WARN] Some phases failed, but the pipeline continued because continueOnError=true.")
+            final_logs.append("[PIPELINE][WARN] Some phases failed, but the pipeline continued because continueOnError=true.")
 
     logger.info("[Pipeline] %s task=%s, outputPath=%s", status, task_id, output_path)
     _send_callback(
@@ -526,7 +641,7 @@ def _run_generate_harness_task(
         {
             "status": "RUNNING",
             "progress": 10,
-            "logs": "ASCTG task started",
+            "logs": ["[ASCTG][INFO] generate_harness task started"],
         },
         task_id,
     )
@@ -543,7 +658,7 @@ def _run_generate_harness_task(
             {
                 "status": "SUCCESS",
                 "progress": 100,
-                "logs": "ASCTG task completed",
+                "logs": ["[ASCTG][SUCCESS] generate_harness task completed"],
             },
             task_id,
         )
@@ -560,7 +675,7 @@ def _run_generate_harness_task(
         {
             "status": "FAILED",
             "progress": 100,
-            "logs": f"ASCTG task failed: {result.get('error', 'unknown error')}",
+            "logs": [f"[ASCTG][ERROR] generate_harness task failed: {result.get('error', 'unknown error')}"],
         },
         task_id,
     )

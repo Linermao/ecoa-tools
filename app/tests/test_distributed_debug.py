@@ -24,7 +24,7 @@ sys.modules.setdefault("yaml", yaml_stub)
 from app.app import create_app
 from app.routes import generator as generator_routes
 from app.services.executor import ToolExecutor
-from app.services.distributed_debug import collect_debug_topology, container_binary_dir, gdbserver_command, write_distributed_debug_assets
+from app.services.distributed_debug import collect_debug_topology, container_binary_dir, gdbserver_command, write_compile_script, write_distributed_debug_assets
 from app.services.distributed_debug_runtime import DistributedDebugRuntime
 
 TEST_TMP_ROOT = Path(__file__).resolve().parents[2] / ".tmp-tests"
@@ -287,6 +287,173 @@ class DistributedDebugTests(unittest.TestCase):
         self.assertTrue((project_path / ".vscode" / "start-distributed-debug.sh").exists())
         self.assertTrue((project_path / ".vscode" / "stop-distributed-debug.sh").exists())
         self.assertTrue((project_path / ".vscode" / "status-distributed-debug.sh").exists())
+        # compile.sh is also generated when cmake_dir is provided
+        self.assertTrue((project_path / ".vscode" / "compile.sh").exists())
+
+    def test_compile_script_integration_mode(self):
+        project_path = self._new_test_root() / "Steps"
+        output_dir = project_path / "6-output"
+        output_dir.mkdir(parents=True)
+        (output_dir / "CMakeLists.txt").write_text("project(integration)\n", encoding="utf-8")
+
+        script_path = write_compile_script(
+            target_dir=str(project_path),
+            build_dir=str(output_dir / "build"),
+            cmake_dir=str(output_dir),
+            project_file="demo.project.xml",
+        )
+
+        script_content = Path(script_path).read_text(encoding="utf-8")
+        self.assertIn("# ECOA LDP Compile Script", script_content)
+        self.assertIn("integration", script_content)
+        # Integration mode should NOT contain harness-specific logic
+        self.assertNotIn(".distributed-debug-wrapper", script_content)
+        self.assertNotIn("CMakeCache.txt", script_content)
+        self.assertIn('_pkg_config_path "apr-1"', script_content)
+        self.assertIn('_pkg_config_path "log4cplus"', script_content)
+        self.assertIn('_pkg_config_path "cunit"', script_content)
+        self.assertIn("-DCMAKE_POLICY_VERSION_MINIMUM=3.5", script_content)
+        self.assertIn('-DLDP_LOG_USE="${LOG_LIBRARY}"', script_content)
+        self.assertIn('LOG_LIBRARY="${1:-log4cplus}"', script_content)
+        self.assertIn('make --no-print-directory -C "${BUILD_DIR}" all', script_content)
+        # Integration mode: CMakeLists.txt under 6-output/
+        self.assertIn("6-output", script_content)
+        self.assertIn("6-Output", script_content)
+
+    def test_compile_script_harness_mode(self):
+        project_path = self._new_test_root() / "Steps"
+        platform_dir = project_path / "6-output" / "platform"
+        platform_dir.mkdir(parents=True)
+        (platform_dir / "CMakeLists.txt").write_text("project(platform)\n", encoding="utf-8")
+
+        script_path = write_compile_script(
+            target_dir=str(project_path),
+            build_dir=str(platform_dir / "build"),
+            cmake_dir=str(platform_dir),
+            project_file="demo-harness.project.xml",
+        )
+
+        script_content = Path(script_path).read_text(encoding="utf-8")
+        self.assertIn("# ECOA LDP Compile Script", script_content)
+        self.assertIn("harness", script_content)
+        # Harness mode: CMakeLists.txt under 6-output/platform/
+        self.assertIn("platform/CMakeLists.txt", script_content)
+        # Harness uses wrapper as cmake source
+        self.assertIn(".distributed-debug-wrapper", script_content)
+        # Harness clears CMakeCache if exists
+        self.assertIn("CMakeCache.txt", script_content)
+        self.assertIn("rm -rf", script_content)
+        # Also has pkg-config dynamic resolution
+        self.assertIn('_pkg_config_path "apr-1"', script_content)
+        self.assertIn('_pkg_config_path "log4cplus"', script_content)
+        self.assertIn('_pkg_config_path "cunit"', script_content)
+
+    def test_compile_script_is_executable(self):
+        project_path = self._new_test_root() / "Steps"
+        output_dir = project_path / "6-output"
+        output_dir.mkdir(parents=True)
+        (output_dir / "CMakeLists.txt").write_text("project(test)\n", encoding="utf-8")
+
+        script_path = write_compile_script(
+            target_dir=str(project_path),
+            build_dir=str(output_dir / "build"),
+            cmake_dir=str(output_dir),
+            project_file="demo.project.xml",
+        )
+
+        self.assertTrue(os.access(script_path, os.X_OK))
+
+    def test_write_distributed_debug_assets_includes_compile_script_when_cmake_dir_provided(self):
+        project_path, build_dir = _create_sample_project(self._new_test_root())
+        topology = collect_debug_topology(str(project_path), str(build_dir))
+
+        assets = write_distributed_debug_assets(
+            target_dir=str(project_path),
+            build_dir=str(build_dir),
+            topology=topology,
+            cmake_dir=str(project_path / "6-Output"),
+            project_file="2test.project.xml",
+        )
+
+        self.assertIn("compile_script", assets)
+        self.assertTrue(Path(assets["compile_script"]).exists())
+        self.assertTrue((project_path / ".vscode" / "compile.sh").exists())
+
+    def test_write_distributed_debug_assets_omits_compile_script_when_no_cmake_dir(self):
+        project_path, build_dir = _create_sample_project(self._new_test_root())
+        topology = collect_debug_topology(str(project_path), str(build_dir))
+
+        assets = write_distributed_debug_assets(
+            target_dir=str(project_path),
+            build_dir=str(build_dir),
+            topology=topology,
+        )
+
+        self.assertNotIn("compile_script", assets)
+        self.assertFalse((project_path / ".vscode" / "compile.sh").exists())
+
+    def test_readme_generated_with_compile_and_distributed_debug(self):
+        project_path, build_dir = _create_sample_project(self._new_test_root())
+        topology = collect_debug_topology(str(project_path), str(build_dir))
+
+        assets = write_distributed_debug_assets(
+            target_dir=str(project_path),
+            build_dir=str(build_dir),
+            topology=topology,
+            cmake_dir=str(project_path / "6-Output"),
+            project_file="2test.project.xml",
+        )
+
+        self.assertIn("readme", assets)
+        readme_path = Path(assets["readme"])
+        self.assertTrue(readme_path.exists())
+        self.assertEqual(readme_path.name, "readme.md")
+        readme_content = readme_path.read_text(encoding="utf-8")
+        # Contains compile script section
+        self.assertIn("compile.sh", readme_content)
+        self.assertIn("Integration", readme_content)
+        # Contains distributed debug section
+        self.assertIn("start-distributed-debug.sh", readme_content)
+        self.assertIn("stop-distributed-debug.sh", readme_content)
+        self.assertIn("status-distributed-debug.sh", readme_content)
+        self.assertIn("launch.json", readme_content)
+
+    def test_readme_harness_mode_content(self):
+        project_path, build_dir = _create_multi_deployment_project(self._new_test_root())
+        topology = collect_debug_topology(
+            str(project_path),
+            str(build_dir),
+            project_file="2test-harness.project.xml",
+        )
+
+        assets = write_distributed_debug_assets(
+            target_dir=str(project_path),
+            build_dir=str(build_dir),
+            topology=topology,
+            cmake_dir=str(project_path / "6-Output"),
+            project_file="2test-harness.project.xml",
+        )
+
+        readme_content = Path(assets["readme"]).read_text(encoding="utf-8")
+        self.assertIn("Harness", readme_content)
+        self.assertIn(".distributed-debug-wrapper", readme_content)
+
+    def test_readme_generated_without_cmake_dir(self):
+        project_path, build_dir = _create_sample_project(self._new_test_root())
+        topology = collect_debug_topology(str(project_path), str(build_dir))
+
+        assets = write_distributed_debug_assets(
+            target_dir=str(project_path),
+            build_dir=str(build_dir),
+            topology=topology,
+        )
+
+        self.assertIn("readme", assets)
+        readme_content = Path(assets["readme"]).read_text(encoding="utf-8")
+        # No compile script section
+        self.assertNotIn("compile.sh", readme_content)
+        # Still has distributed debug section
+        self.assertIn("start-distributed-debug.sh", readme_content)
 
     def test_find_cmakelists_dir_prefers_platform_subdir_for_harness_ldp(self):
         project_path = self._new_test_root() / "Steps"

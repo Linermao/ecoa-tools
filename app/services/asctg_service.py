@@ -435,37 +435,53 @@ def execute_asctg_from_steps_dir(
     return result
 
 
+def _classify_line(line: str) -> str:
+    """Classify a log line into INFO, WARN, or ERROR based on content."""
+    lower = line.lower()
+    if any(kw in lower for kw in ("error", "fatal", "failed", "failure", "undefined reference", "no such file")):
+        return "ERROR"
+    if any(kw in lower for kw in ("warning", "warn", "deprecated")):
+        return "WARN"
+    return "INFO"
+
+
 def build_asctg_logs(
     project_id: str,
     steps_dir: str,
     selected_components: list[str],
     result: dict,
 ) -> list[str]:
-    """Build detailed frontend logs for an ASCTG execution."""
+    """Build detailed frontend logs for an ASCTG execution with [PHASE][LEVEL] format."""
     logs: list[str] = [
-        f"[ASCTG] Project: {project_id}",
-        f"[ASCTG] Steps dir: {steps_dir}",
-        f"[ASCTG] Selected components: {', '.join(selected_components) if selected_components else '(auto config mode)'}",
+        f"[ASCTG][INFO] Project: {project_id}",
+        f"[ASCTG][INFO] Steps dir: {steps_dir}",
+        f"[ASCTG][INFO] Selected components: {', '.join(selected_components) if selected_components else '(auto config mode)'}",
     ]
 
     if result.get("composite_path"):
-        logs.append(f"[ASCTG] Composite: {result['composite_path']}")
+        logs.append(f"[ASCTG][INFO] Composite: {result['composite_path']}")
     if result.get("config_path"):
-        logs.append(f"[ASCTG] Config: {result['config_path']}")
+        logs.append(f"[ASCTG][INFO] Config: {result['config_path']}")
     if result.get("workspace_root"):
-        logs.append(f"[ASCTG] Workspace: {result['workspace_root']}")
+        logs.append(f"[ASCTG][INFO] Workspace: {result['workspace_root']}")
 
     for line in (result.get("stdout") or "").splitlines():
         if line.strip():
-            logs.append(f"[ASCTG] {line}")
+            level = _classify_line(line)
+            logs.append(f"[ASCTG][{level}] {line}")
     for line in (result.get("stderr") or "").splitlines():
         if line.strip():
-            logs.append(f"[ASCTG] [STDERR] {line}")
+            level = _classify_line(line)
+            logs.append(f"[ASCTG][{level}] {line}")
 
     if result.get("return_code") is not None:
-        logs.append(f"[ASCTG] Return code: {result['return_code']}")
+        rc = result["return_code"]
+        if rc == 0:
+            logs.append(f"[ASCTG][SUCCESS] Test generation completed (return_code=0)")
+        else:
+            logs.append(f"[ASCTG][ERROR] Test generation failed (return_code={rc})")
 
     if result.get("error"):
-        logs.append(f"[ASCTG] [ERROR] {result['error']}")
+        logs.append(f"[ASCTG][ERROR] {result['error']}")
 
     return logs
