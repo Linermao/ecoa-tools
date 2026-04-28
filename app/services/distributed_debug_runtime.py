@@ -27,6 +27,12 @@ RUNTIME_COMPOSE_FILENAME = "distributed-debug.runtime.compose.yml"
 SESSION_FILENAME = "distributed-debug.session.json"
 SESSION_SUBNET_PREFIX = "172.29"
 
+_DOCKER_HOST_CANDIDATES = [
+    "unix:///var/run/docker.sock",
+    "tcp://host.docker.internal:2375",
+    "tcp://host.docker.internal:2376",
+]
+
 
 class DistributedDebugRuntimeError(RuntimeError):
     """Raised when distributed debug orchestration fails."""
@@ -58,8 +64,60 @@ class DistributedDebugRuntime:
 
     def __init__(self, default_client_container: Optional[str] = None):
         self.default_client_container = default_client_container or DEFAULT_CLIENT_CONTAINER
+        self._docker_host_checked: Optional[str] = None
+
+    def _ensure_docker_available(self) -> str:
+        """Detect a working Docker connection and set DOCKER_HOST accordingly.
+
+        Tries candidates in order, caches the result.  Raises
+        DistributedDebugRuntimeError when no connection can be established.
+        """
+        if self._docker_host_checked is not None:
+            return self._docker_host_checked
+
+        explicit_host = os.environ.get("DOCKER_HOST")
+        candidates = []
+        if explicit_host:
+            candidates.append(explicit_host)
+        candidates.extend(candidate for candidate in _DOCKER_HOST_CANDIDATES if candidate != explicit_host)
+
+        last_error = ""
+        for candidate in candidates:
+            os.environ["DOCKER_HOST"] = candidate
+            try:
+                subprocess.run(
+                    ["docker", "info", "--format", "{{.ServerVersion}}"],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    timeout=10,
+                )
+                self._docker_host_checked = candidate
+                return candidate
+            except FileNotFoundError:
+                last_error = "Docker CLI is not installed in the ecoa-tools container."
+                break
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+                stderr = getattr(exc, "stderr", "") or str(exc)
+                last_error = f"DOCKER_HOST={candidate}: {stderr}"
+                continue
+
+        # Restore the original setting so we don't leave a newly tried broken value behind.
+        if explicit_host:
+            os.environ["DOCKER_HOST"] = explicit_host
+        else:
+            os.environ.pop("DOCKER_HOST", None)
+        raise DistributedDebugRuntimeError(
+            f"Could not connect to Docker daemon. Tried: {', '.join(candidates)}. "
+            f"Last error: {last_error}. "
+            "Solutions: "
+            "1) Mount /var/run/docker.sock into the ecoa-tools container; "
+            "2) If using a TCP Docker API, set DOCKER_HOST to a reachable endpoint; "
+            "3) Ensure Docker daemon is running on the host."
+        )
 
     def start(self, target_dir: str, client_container: Optional[str] = None) -> Dict[str, Any]:
+        self._ensure_docker_available()
         context = self._resolve_context(target_dir)
         client_name = client_container or self.default_client_container
         session = self._create_session(context, client_name)
@@ -102,6 +160,7 @@ class DistributedDebugRuntime:
         }
 
     def stop(self, target_dir: str, client_container: Optional[str] = None) -> Dict[str, Any]:
+        self._ensure_docker_available()
         context = self._resolve_context(target_dir)
         session = self._load_or_create_session(context, client_container or self.default_client_container)
         client_name = client_container or session.client_container or self.default_client_container
@@ -126,6 +185,7 @@ class DistributedDebugRuntime:
         }
 
     def status(self, target_dir: str, client_container: Optional[str] = None) -> Dict[str, Any]:
+        self._ensure_docker_available()
         context = self._resolve_context(target_dir)
         session = self._load_or_create_session(context, client_container or self.default_client_container)
         client_name = client_container or session.client_container or self.default_client_container

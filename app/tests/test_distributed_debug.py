@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 import tempfile
 import sys
 import types
@@ -142,6 +143,8 @@ class DistributedDebugTests(unittest.TestCase):
         running_services: str = "ecoa-machine0\necoa-machine1\n",
     ):
         def side_effect(command, *args, **kwargs):
+            if command[:3] == ["docker", "info", "--format"]:
+                return self._docker_result(stdout="24.0.0\n")
             if command[:4] == ["docker", "network", "ls", "--format"]:
                 return self._docker_result(stdout="")
             if command[:3] == ["docker", "compose", "--project-name"] and "up" in command:
@@ -207,6 +210,15 @@ class DistributedDebugTests(unittest.TestCase):
         self.assertIn("/workspace/project/6-Output/build/lib", command)
         self.assertIn("gdbserver 0.0.0.0:2000 ./platform", command)
 
+    def test_gdbserver_command_fails_before_backgrounding_when_gdbserver_is_missing(self):
+        project_path, build_dir = _create_sample_project(self._new_test_root())
+        topology = collect_debug_topology(str(project_path), str(build_dir))
+
+        command = gdbserver_command(str(build_dir), topology.processes[0])
+
+        self.assertIn("command -v gdbserver", command)
+        self.assertLess(command.index("command -v gdbserver"), command.index("nohup gdbserver"))
+
     def test_container_binary_dir_keeps_harness_platform_subpath(self):
         build_dir = "/workspace/demo/task/Steps/6-output/platform/build"
 
@@ -258,6 +270,8 @@ class DistributedDebugTests(unittest.TestCase):
         self.assertIn('ECOA_DISTRIBUTED_DEBUG_API_URL:-http://ecoa-tools:5000', start_script)
         self.assertIn("/api/distributed-debug/start", start_script)
         self.assertIn('"client_container": os.environ.get("ECOA_DISTRIBUTED_DEBUG_CLIENT_CONTAINER", "code-server")', start_script)
+        self.assertIn("优先确认 ecoa-tools 已挂载 /var/run/docker.sock", start_script)
+        self.assertNotIn("Docker Desktop (WSL2/macOS) 需设置 DOCKER_HOST=tcp://host.docker.internal:2375", start_script)
         self.assertNotIn("docker compose -f .vscode/distributed-debug.compose.yml up -d", start_script)
 
         stop_script = Path(assets["stop_script"]).read_text(encoding="utf-8")
@@ -567,6 +581,32 @@ class DistributedDebugTests(unittest.TestCase):
         self.assertTrue(any(command[:3] == ["docker", "compose", "--project-name"] and "up" in command for command in commands))
         self.assertTrue(any(command[:3] == ["docker", "network", "connect"] and command[3] == result["network_name"] for command in commands))
         self.assertTrue(any(command[:3] == ["docker", "compose", "--project-name"] and command[3] == result["compose_project_name"] and "ps" in command for command in commands))
+
+    def test_runtime_falls_back_to_mounted_docker_socket_when_env_host_unreachable(self):
+        attempts = []
+
+        def docker_info_side_effect(command, *args, **kwargs):
+            attempts.append(os.environ.get("DOCKER_HOST"))
+            if command[:3] != ["docker", "info", "--format"]:
+                raise AssertionError(f"Unexpected command: {command}")
+            if os.environ.get("DOCKER_HOST") == "unix:///var/run/docker.sock":
+                return self._docker_result(stdout="24.0.0\n")
+            raise subprocess.CalledProcessError(
+                returncode=1,
+                cmd=command,
+                stderr="Cannot connect to Docker daemon",
+            )
+
+        runtime = DistributedDebugRuntime()
+
+        with patch.dict(os.environ, {"DOCKER_HOST": "tcp://host.docker.internal:2375"}), patch(
+            "app.services.distributed_debug_runtime.subprocess.run",
+            side_effect=docker_info_side_effect,
+        ):
+            docker_host = runtime._ensure_docker_available()
+
+        self.assertEqual(docker_host, "unix:///var/run/docker.sock")
+        self.assertEqual(attempts[:2], ["tcp://host.docker.internal:2375", "unix:///var/run/docker.sock"])
 
     def test_runtime_maps_host_workspace_path_from_container_mount(self):
         runtime = DistributedDebugRuntime()

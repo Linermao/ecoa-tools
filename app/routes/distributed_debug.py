@@ -79,6 +79,16 @@ def distributed_debug_status() -> tuple:
     return jsonify(result), 200
 
 
+@bp.route("/check-docker", methods=["GET"])
+def check_docker() -> tuple:
+    """Check Docker daemon connectivity from the ecoa-tools container."""
+    try:
+        docker_host = runtime_service._ensure_docker_available()
+        return jsonify({"available": True, "docker_host": docker_host}), 200
+    except DistributedDebugRuntimeError as exc:
+        return jsonify({"available": False, "error": str(exc)}), 200
+
+
 def _require_json_body() -> dict:
     if not request.is_json:
         raise BadRequest("Request must be JSON")

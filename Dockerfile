@@ -5,15 +5,12 @@ ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /app
 
 # -------------------------------------------------------------------
-# Switch to TUNA mirrors
+# Switch to TUNA mirrors, install system deps, create venv, install Python deps
+# Combined into fewer layers to reduce image size
 # -------------------------------------------------------------------
 RUN sed -i 's|archive.ubuntu.com|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list && \
-    sed -i 's|security.ubuntu.com|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list
-
-# -------------------------------------------------------------------
-# Install system deps + Python 3.10 (official)
-# -------------------------------------------------------------------
-RUN apt-get update && apt-get install -y \
+    sed -i 's|security.ubuntu.com|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list && \
+    apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-venv \
     python3-dev \
@@ -24,7 +21,6 @@ RUN apt-get update && apt-get install -y \
     gdbserver \
     cmake \
     make \
-    gdb \
     bison \
     flex \
     libapr1-dev \
@@ -39,7 +35,7 @@ RUN apt-get update && apt-get install -y \
     docker.io \
     docker-compose-v2 \
     && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 # -------------------------------------------------------------------
 # Copy project
@@ -47,30 +43,19 @@ RUN apt-get update && apt-get install -y \
 COPY . /app/
 
 # -------------------------------------------------------------------
-# Create venv (python3 == 3.10)
+# Create venv + install Python deps + editable installs (combined layer)
 # -------------------------------------------------------------------
-RUN python3 -m venv /app/.venv
+RUN python3 -m venv /app/.venv && \
+    mkdir -p /root/.pip && \
+    printf "[global]\nindex-url = https://pypi.tuna.tsinghua.edu.cn/simple\n" > /root/.pip/pip.conf
 
 ENV VIRTUAL_ENV=/app/.venv
 ENV PATH="/app/.venv/bin:$PATH"
 
-# -------------------------------------------------------------------
-# pip mirror (TUNA)
-# -------------------------------------------------------------------
-RUN mkdir -p /root/.pip && \
-    printf "[global]\nindex-url = https://pypi.tuna.tsinghua.edu.cn/simple\n" > /root/.pip/pip.conf
-
-# -------------------------------------------------------------------
-# Install Python deps
-# -------------------------------------------------------------------
-RUN python -m pip install --upgrade "pip>=23" && \
-    python -m pip install --upgrade "setuptools<82" wheel && \
-    python -m pip install -r requirements.txt
-
-# -------------------------------------------------------------------
-# Editable installs
-# -------------------------------------------------------------------
-RUN for d in \
+RUN python -m pip install --no-cache-dir --upgrade "pip>=23" && \
+    python -m pip install --no-cache-dir --upgrade "setuptools<82" wheel && \
+    python -m pip install --no-cache-dir -r requirements.txt && \
+    for d in \
     ecoa-toolset \
     ecoa-exvt \
     ecoa-csmgvt \
@@ -78,9 +63,10 @@ RUN for d in \
     ecoa-asctg \
     ecoa-ldp; do \
         if [ -d "/app/as6-tools/$d" ]; then \
-            pip install -e "/app/as6-tools/$d"; \
+            pip install --no-cache-dir -e "/app/as6-tools/$d"; \
         fi; \
-    done
+    done && \
+    rm -rf /root/.cache/pip /tmp/*
 
 EXPOSE 5000
 CMD ["python", "main.py"]

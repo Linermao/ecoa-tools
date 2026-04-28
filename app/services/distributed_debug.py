@@ -59,6 +59,7 @@ def gdbserver_command(build_dir: str, process: DebugProcess) -> str:
     return (
         f"mkdir -p {binary_dir}/../logs && "
         f"cd {binary_dir} && "
+        "command -v gdbserver >/dev/null && "
         f"export LD_LIBRARY_PATH={library_dir}:${{LD_LIBRARY_PATH:-}} && "
         f"nohup gdbserver 0.0.0.0:{process.port} ./{process.name} "
         f"> ../logs/{process.name}.gdbserver.log 2>&1 &"
@@ -479,6 +480,16 @@ def _api_script(endpoint: str, method: str = "POST") -> str:
         '    error_body = exc.read().decode("utf-8", errors="replace")',
         '    sys.stderr.write(error_body or str(exc))',
         '    sys.stderr.write("\\n")',
+        "    try:",
+        '        err_data = json.loads(error_body)',
+        '        err_msg = err_data.get("message", "")',
+        '        if "docker" in err_msg.lower() or "docker.sock" in err_msg.lower():',
+        '            sys.stderr.write("\\n[提示] Docker 连接失败，请检查：\\n")',
+        '            sys.stderr.write("  1. 优先确认 ecoa-tools 已挂载 /var/run/docker.sock\\n")',
+        '            sys.stderr.write("  2. 如设置了 DOCKER_HOST，请确认对应 Docker API 可达；不可达时请取消该变量\\n")',
+        '            sys.stderr.write("  3. 宿主机 Docker daemon 是否正在运行\\n")',
+        "    except (json.JSONDecodeError, AttributeError):",
+        "        pass",
         "    raise",
         "PY",
         "",
