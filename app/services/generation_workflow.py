@@ -1,15 +1,21 @@
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-HARNESS_INITIAL_PHASES = ["EXVT", "ASCTG", "MSCIGT"]
-HARNESS_CONTINUE_PHASES = ["CSMGVT", "LDP"]
+DIRECT_DEV_INITIAL_PHASES = ["EXVT", "MSCIGT"]
+DIRECT_DEV_CONTINUE_PHASES = ["CSMGVT", "LDP"]
+HARNESS_DEV_INITIAL_PHASES = ["EXVT", "ASCTG", "MSCIGT"]
+HARNESS_DEV_CONTINUE_PHASES = ["CSMGVT", "LDP"]
 INTEGRATION_INITIAL_PHASES = ["EXVT", "LDP"]
 INTEGRATION_INITIAL_ORDER = ["EXVT", "CSMGVT", "LDP"]
 INTEGRATION_CONTINUE_PHASES = ["CSMGVT", "LDP"]
-KNOWN_WORKFLOW_MODES = {"HARNESS", "INTEGRATION"}
+KNOWN_WORKFLOW_MODES = {"DIRECT_DEV", "HARNESS_DEV", "HARNESS", "INTEGRATION"}
 PHASE_ORDER = {
-    ("HARNESS", False): HARNESS_INITIAL_PHASES,
-    ("HARNESS", True): HARNESS_CONTINUE_PHASES,
+    ("DIRECT_DEV", False): DIRECT_DEV_INITIAL_PHASES,
+    ("DIRECT_DEV", True): DIRECT_DEV_CONTINUE_PHASES,
+    ("HARNESS_DEV", False): HARNESS_DEV_INITIAL_PHASES,
+    ("HARNESS_DEV", True): HARNESS_DEV_CONTINUE_PHASES,
+    ("HARNESS", False): HARNESS_DEV_INITIAL_PHASES,
+    ("HARNESS", True): HARNESS_DEV_CONTINUE_PHASES,
     ("INTEGRATION", False): INTEGRATION_INITIAL_ORDER,
     ("INTEGRATION", True): INTEGRATION_CONTINUE_PHASES,
 }
@@ -32,7 +38,10 @@ class WorkflowContext:
 
 
 def _normalize_workflow_mode(workflow_mode: str | None) -> str:
-    normalized = (workflow_mode or "INTEGRATION").upper()
+    normalized = (workflow_mode or "DIRECT_DEV").upper()
+    # Legacy compatibility: HARNESS → HARNESS_DEV
+    if normalized == "HARNESS":
+        return "HARNESS_DEV"
     if normalized not in KNOWN_WORKFLOW_MODES:
         raise ValueError(f"Unknown workflow mode: {workflow_mode}")
     return normalized
@@ -49,8 +58,10 @@ def _format_allowed_phases(phases: list[str]) -> str:
 def default_selected_phases(workflow_mode: str | None, continuing: bool) -> list[str]:
     mode = _normalize_workflow_mode(workflow_mode)
 
-    if mode == "HARNESS":
-        return HARNESS_CONTINUE_PHASES[:] if continuing else HARNESS_INITIAL_PHASES[:]
+    if mode == "DIRECT_DEV":
+        return DIRECT_DEV_CONTINUE_PHASES[:] if continuing else DIRECT_DEV_INITIAL_PHASES[:]
+    if mode == "HARNESS_DEV":
+        return HARNESS_DEV_CONTINUE_PHASES[:] if continuing else HARNESS_DEV_INITIAL_PHASES[:]
     if continuing:
         return INTEGRATION_CONTINUE_PHASES[:]
     return INTEGRATION_INITIAL_PHASES[:]
@@ -68,8 +79,28 @@ def resolve_phase_steps(
     return [phase for phase in canonical_order if phase in selected_set]
 
 
-def _resolve_harness_project_file(base_project_file: str, steps_root: str | Path) -> str:
+def _resolve_harness_project_file(base_project_file: str, steps_root: str | Path, asctg_result: dict | None = None) -> str:
+    """Resolve the harness project file after ASCTG.
+
+    Priority:
+    1. Use the project file returned by ASCTG result (if available).
+    2. Match by *-harness.project.xml glob pattern.
+    3. Fall back to first non-base project file (legacy behavior).
+    """
     steps_path = Path(steps_root)
+
+    # Priority 1: ASCTG result may indicate the harness project file
+    if asctg_result and asctg_result.get("harness_project_file"):
+        harness_name = asctg_result["harness_project_file"]
+        if (steps_path / harness_name).exists() or any(steps_path.rglob(harness_name)):
+            return harness_name
+
+    # Priority 2: Match by *-harness.project.xml pattern
+    harness_glob_candidates = sorted(steps_path.rglob("*-harness.project.xml"))
+    if harness_glob_candidates:
+        return harness_glob_candidates[0].name
+
+    # Priority 3: Legacy fallback — first non-base project file
     project_candidates = sorted(steps_path.rglob("*.project.xml"))
     harness_candidates = [candidate for candidate in project_candidates if candidate.name != base_project_file]
 
@@ -81,8 +112,8 @@ def _resolve_harness_project_file(base_project_file: str, steps_root: str | Path
     )
 
 
-def activate_harness_project(context: WorkflowContext, steps_root: str | Path) -> WorkflowContext:
-    harness_project_file = _resolve_harness_project_file(context.base_project_file, steps_root)
+def activate_harness_project(context: WorkflowContext, steps_root: str | Path, asctg_result: dict | None = None) -> WorkflowContext:
+    harness_project_file = _resolve_harness_project_file(context.base_project_file, steps_root, asctg_result)
     return context.with_harness_project(harness_project_file)
 
 
@@ -95,16 +126,28 @@ def validate_phase_selection(
     phases = [] if selected_phases is None else selected_phases
     allowed = PHASE_ORDER[(mode, continuing)]
 
-    if mode == "HARNESS" and not continuing:
+    if mode == "DIRECT_DEV" and not continuing:
         invalid = [phase for phase in phases if phase not in allowed]
         if invalid:
-            raise ValueError("HARNESS initial runs only allow EXVT, ASCTG and MSCIGT")
+            raise ValueError("DIRECT_DEV initial runs only allow EXVT and MSCIGT")
         return
 
-    if mode == "HARNESS" and continuing:
+    if mode == "DIRECT_DEV" and continuing:
         invalid = [phase for phase in phases if phase not in allowed]
         if invalid:
-            raise ValueError("HARNESS continue runs only allow CSMGVT and LDP")
+            raise ValueError("DIRECT_DEV continue runs only allow CSMGVT and LDP")
+        return
+
+    if mode == "HARNESS_DEV" and not continuing:
+        invalid = [phase for phase in phases if phase not in allowed]
+        if invalid:
+            raise ValueError("HARNESS_DEV initial runs only allow EXVT, ASCTG and MSCIGT")
+        return
+
+    if mode == "HARNESS_DEV" and continuing:
+        invalid = [phase for phase in phases if phase not in allowed]
+        if invalid:
+            raise ValueError("HARNESS_DEV continue runs only allow CSMGVT and LDP")
         return
 
     invalid = [phase for phase in phases if phase not in allowed]
@@ -122,7 +165,8 @@ def should_await_code(
     continuing: bool,
 ) -> bool:
     mode = _normalize_workflow_mode(workflow_mode)
-    if mode != "HARNESS" or continuing or had_failure:
+    # Both DIRECT_DEV and HARNESS_DEV enter AWAITING_CODE after MSCIGT
+    if mode not in ("DIRECT_DEV", "HARNESS_DEV") or continuing or had_failure:
         return False
 
     phases = set(selected_phases or [])

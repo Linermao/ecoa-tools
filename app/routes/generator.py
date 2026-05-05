@@ -18,6 +18,7 @@ from flask import Blueprint, jsonify, request
 from app.services.asctg_service import build_asctg_logs, execute_asctg_from_steps_dir
 from app.services.generation_workflow import (
     WorkflowContext,
+    _normalize_workflow_mode,
     activate_harness_project,
     default_selected_phases,
     parse_continuing_flag,
@@ -26,6 +27,11 @@ from app.services.generation_workflow import (
     validate_phase_selection,
 )
 from app.services.executor import ToolExecutor
+from app.services.code_backflow import (
+    scan_backflow_files,
+    generate_patch,
+    apply_patch,
+)
 from app.utils.logger import setup_logger
 
 bp = Blueprint("generator", __name__)
@@ -368,6 +374,289 @@ def _build_tool_logs(tool_id: str, result: dict) -> list[str]:
     return tool_logs
 
 
+def _check_csmgvt_runtime_log(steps_root: Path, context: WorkflowContext) -> dict:
+    """Check CSMGVT runtime.log for key traces and return structured result.
+
+    Returns a dict with:
+    - runtimeLogFound: bool
+    - runtimeLogPath: str | None
+    - keyTraces: dict of trace name -> bool (found or not)
+    - failureKeywords: list of found failure keywords
+    - isEmpty: bool (runtime.log exists but is empty)
+    """
+    active_project = steps_root / context.active_project_file
+    project_dir = active_project.parent if active_project.suffix == ".xml" else active_project
+
+    # Search for runtime.log in common locations
+    runtime_log_candidates = list(Path(project_dir).rglob("runtime.log"))
+    if not runtime_log_candidates:
+        return {
+            "runtimeLogFound": False,
+            "runtimeLogPath": None,
+            "keyTraces": {},
+            "failureKeywords": [],
+            "isEmpty": False,
+        }
+
+    runtime_log = runtime_log_candidates[0]
+    content = ""
+    try:
+        content = runtime_log.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+    is_empty = not content.strip()
+
+    # Key traces to check
+    key_traces = {
+        "harness_publish": any(kw in content for kw in ("HARNESS publish", "publish data")),
+        "reader_data_updated": "DATA updated" in content,
+        "reader_finish": "Reader finish" in content,
+        "harness_received_finish": any(kw in content for kw in ("HARNESS received finish", "received finish")),
+    }
+
+    # Failure keywords
+    failure_keywords = []
+    for kw in ("assert failed", "Assertion failed", "Segmentation fault", "Aborted", "SIGABRT", "SIGSEGV"):
+        if kw in content:
+            failure_keywords.append(kw)
+
+    return {
+        "runtimeLogFound": True,
+        "runtimeLogPath": str(runtime_log),
+        "keyTraces": key_traces,
+        "failureKeywords": failure_keywords,
+        "isEmpty": is_empty,
+    }
+
+
+def _check_csmgvt_source_integrity(steps_root: Path, context: WorkflowContext, callback_url: str, task_id: str, output_path: str) -> bool:
+    """Pre-check CSMGVT source integrity: verify HARNESS src and inc-gen exist.
+
+    Returns True if integrity check passes, False if a FAILED callback was sent.
+    """
+    active_project = steps_root / context.active_project_file
+    if not active_project.exists():
+        _send_callback(
+            callback_url,
+            _callback_payload(
+                {
+                    "status": "FAILED",
+                    "subStatus": "RUNNING_CSMGVT",
+                    "progress": 60,
+                    "outputPath": output_path,
+                    "logs": [
+                        "[CSMGVT][ERROR] Active project file not found — cannot verify source integrity.",
+                        f"[CSMGVT][ERROR] Expected: {active_project}",
+                        "[CSMGVT][INFO] Return to CODE_EDIT_REQUIRED state and ensure the harness project is generated.",
+                    ],
+                },
+                context,
+            ),
+            task_id,
+        )
+        return False
+
+    # Check that the active project directory has src/ subdirectories
+    project_dir = active_project.parent
+    src_dirs = list(project_dir.rglob("src"))
+    if not src_dirs:
+        _send_callback(
+            callback_url,
+            _callback_payload(
+                {
+                    "status": "FAILED",
+                    "subStatus": "RUNNING_CSMGVT",
+                    "progress": 60,
+                    "outputPath": output_path,
+                    "logs": [
+                        "[CSMGVT][ERROR] No src/ directory found under the active project — HARNESS source code is missing.",
+                        f"[CSMGVT][ERROR] Project directory: {project_dir}",
+                        "[CSMGVT][INFO] Open Code Server and add business logic before running CSMGVT.",
+                    ],
+                },
+                context,
+            ),
+            task_id,
+        )
+        return False
+
+    # Check inc-gen directories exist for the tested components
+    inc_gen_dirs = list(project_dir.rglob("inc-gen"))
+    if not inc_gen_dirs:
+        _send_callback(
+            callback_url,
+            _callback_payload(
+                {
+                    "status": "FAILED",
+                    "subStatus": "RUNNING_CSMGVT",
+                    "progress": 60,
+                    "outputPath": output_path,
+                    "logs": [
+                        "[CSMGVT][ERROR] No inc-gen/ directory found — component interface headers are missing.",
+                        f"[CSMGVT][ERROR] Project directory: {project_dir}",
+                        "[CSMGVT][INFO] Ensure MSCIGT ran successfully to generate interface headers before CSMGVT.",
+                    ],
+                },
+                context,
+            ),
+            task_id,
+        )
+        return False
+
+    return True
+
+
+def _check_csmgvt_output_products(steps_root: Path, context: WorkflowContext) -> dict:
+    """Check CSMGVT output directory for expected products.
+
+    Returns a dict with:
+    - outputDirFound: bool
+    - outputDirPath: str | None
+    - missingProducts: list of missing expected files/dirs
+    - foundProducts: list of found expected files/dirs
+    """
+    active_project = steps_root / context.active_project_file
+    project_dir = active_project.parent if active_project.suffix == ".xml" else active_project
+
+    expected_products = [
+        "CMakeLists.txt",
+        "src/main.cpp",
+    ]
+
+    harness_dirs = list(Path(project_dir).rglob("*HARNESS*")) + list(Path(project_dir).rglob("*harness*"))
+    harness_found = any(d.is_dir() for d in harness_dirs)
+
+    missing: list[str] = []
+    found: list[str] = []
+
+    for product in expected_products:
+        candidates = list(Path(project_dir).rglob(product))
+        if candidates:
+            found.append(product)
+        else:
+            missing.append(product)
+
+    if harness_found:
+        found.append("HARNESS component directory")
+    else:
+        missing.append("HARNESS component directory")
+
+    return {
+        "outputDirFound": project_dir.exists(),
+        "outputDirPath": str(project_dir) if project_dir.exists() else None,
+        "missingProducts": missing,
+        "foundProducts": found,
+    }
+
+
+def _classify_csmgvt_compile_failure(result: dict) -> list[str]:
+    """Classify CSMGVT compilation failure into readable error categories."""
+    errors: list[str] = []
+    compile_stderr = result.get("compile_stderr", "") or ""
+    cmake_rc = result.get("cmake_return_code")
+    make_rc = result.get("make_return_code") or result.get("compile_return_code", -1)
+
+    if cmake_rc is not None and cmake_rc != 0:
+        if "Could not find" in compile_stderr or "not found" in compile_stderr.lower():
+            if "HARNESS" in compile_stderr or "harness" in compile_stderr.lower():
+                errors.append("CMAKE_HARNESS_MISSING: CMake cannot find HARNESS source files — open Code Server to add business logic")
+            elif "inc-gen" in compile_stderr or "include" in compile_stderr.lower():
+                errors.append("CMAKE_INC_GEN_MISSING: CMake cannot find component interface headers (inc-gen) — ensure MSCIGT ran successfully")
+            else:
+                errors.append(f"CMAKE_CONFIG_ERROR: CMake configuration failed (return_code={cmake_rc})")
+        else:
+            errors.append(f"CMAKE_FAILED: CMake failed with return_code={cmake_rc}")
+    elif make_rc != 0 and make_rc != -1:
+        if "undefined reference" in compile_stderr or "undefined" in compile_stderr.lower():
+            if "HARNESS" in compile_stderr or "harness" in compile_stderr.lower():
+                errors.append("MAKE_HARNESS_MISSING: Linker cannot find HARNESS function implementations — open Code Server to add test logic")
+            else:
+                errors.append(f"MAKE_LINK_ERROR: Linker errors detected (return_code={make_rc})")
+        elif "fatal error" in compile_stderr or "No such file" in compile_stderr:
+            if "inc-gen" in compile_stderr:
+                errors.append("MAKE_INC_GEN_MISSING: Compiler cannot find component interface headers — ensure MSCIGT generated inc-gen correctly")
+            elif "HARNESS" in compile_stderr or "harness" in compile_stderr.lower():
+                errors.append("MAKE_HARNESS_MISSING: Compiler cannot find HARNESS headers — open Code Server to add business logic")
+            else:
+                errors.append(f"MAKE_COMPILE_ERROR: Compilation errors detected (return_code={make_rc})")
+        else:
+            errors.append(f"MAKE_FAILED: Make failed with return_code={make_rc}")
+
+    if not errors and not result.get("compile_success", True):
+        errors.append(f"COMPILE_UNKNOWN: Compilation failed (return_code={make_rc})")
+
+    return errors
+
+
+def _run_csm_executable(build_dir: str, timeout_seconds: int = 60) -> dict:
+    """Run the csm executable and capture output.
+
+    Returns a dict with:
+    - csmRan: bool
+    - csmReturnCode: int
+    - csmStdout: str
+    - csmStderr: str
+    - csmTimedOut: bool
+    - csmTimeoutNormal: bool  (return code 124 from timeout = normal stop)
+    """
+    import subprocess
+
+    build_path = Path(build_dir)
+    csm_candidates = list(build_path.rglob("csm")) + list(build_path.rglob("csm.*"))
+    bin_dir = build_path / "bin"
+    if bin_dir.exists():
+        csm_candidates = list(bin_dir.glob("csm*")) + csm_candidates
+
+    if not csm_candidates:
+        platform_candidates = list(build_path.rglob("platform"))
+        if bin_dir.exists():
+            platform_candidates = list(bin_dir.glob("platform*")) + platform_candidates
+        if platform_candidates:
+            csm_candidates = platform_candidates[:1]
+        else:
+            return {
+                "csmRan": False, "csmReturnCode": -1, "csmStdout": "",
+                "csmStderr": "No csm or platform executable found in build directory",
+                "csmTimedOut": False, "csmTimeoutNormal": False,
+            }
+
+    csm_exe = str(csm_candidates[0])
+    if not os.access(csm_exe, os.X_OK):
+        return {
+            "csmRan": False, "csmReturnCode": -1, "csmStdout": "",
+            "csmStderr": f"Executable not executable: {csm_exe}",
+            "csmTimedOut": False, "csmTimeoutNormal": False,
+        }
+
+    try:
+        result = subprocess.run(
+            ["timeout", str(timeout_seconds), csm_exe],
+            cwd=str(build_path),
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds + 10,
+        )
+        rc = result.returncode
+        timed_out = rc == 124
+        return {
+            "csmRan": True, "csmReturnCode": rc,
+            "csmStdout": result.stdout, "csmStderr": result.stderr,
+            "csmTimedOut": timed_out, "csmTimeoutNormal": timed_out,
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "csmRan": True, "csmReturnCode": 124, "csmStdout": "",
+            "csmStderr": "CSM execution timed out (treated as normal stop)",
+            "csmTimedOut": True, "csmTimeoutNormal": True,
+        }
+    except Exception as exc:
+        return {
+            "csmRan": False, "csmReturnCode": -1, "csmStdout": "",
+            "csmStderr": str(exc), "csmTimedOut": False, "csmTimeoutNormal": False,
+        }
+
+
 def _run_pipeline(
     task_id: str,
     project_id: str,
@@ -388,7 +677,7 @@ def _run_pipeline(
     had_failure = False
     output_path = output_dir
     tool_cwd = f"{project_id}/{task_id}/Steps"
-    mode = workflow_mode or "INTEGRATION"
+    mode = _normalize_workflow_mode(workflow_mode)
 
     project_name, resolved_project_file, steps_root = _resolve_project_file(project_id, task_id, skip_export, callback_url, task_id)
     if not resolved_project_file or not steps_root:
@@ -520,9 +809,9 @@ def _run_pipeline(
             )
 
         if success:
-            if tool_id == "asctg" and mode == "HARNESS":
+            if tool_id == "asctg" and mode in ("HARNESS", "HARNESS_DEV"):
                 try:
-                    context = activate_harness_project(context, steps_root)
+                    context = activate_harness_project(context, steps_root, result)
                 except FileNotFoundError as exc:
                     had_failure = True
                     _send_callback(
@@ -554,6 +843,142 @@ def _run_pipeline(
                 ),
                 task_id,
             )
+            # CSMGVT: four sub-steps with structured callbacks
+            if tool_id == "csmgvt":
+                # ── Sub-step 1: Output product check ──────────────────────
+                product_result = _check_csmgvt_output_products(steps_root, context)
+                product_logs = []
+                if product_result["missingProducts"]:
+                    product_logs.append("[CSMGVT][SUB1][WARN] === Output Product Check ===")
+                    for mp in product_result["missingProducts"]:
+                        product_logs.append(f"[CSMGVT][SUB1][WARN] Missing: {mp}")
+                    for fp in product_result["foundProducts"]:
+                        product_logs.append(f"[CSMGVT][SUB1][INFO] Found: {fp}")
+                else:
+                    product_logs.append("[CSMGVT][SUB1][SUCCESS] All expected output products found")
+
+                _send_callback(
+                    callback_url,
+                    _callback_payload(
+                        {
+                        "status": "GENERATING",
+                        "subStatus": sub_status,
+                        "progress": p_start + (p_end - p_start) * 1 // 4,
+                        "logs": product_logs,
+                        "csmgvtSubStep": "output_check",
+                        "csmgvtProductCheck": product_result,
+                        },
+                        context,
+                    ),
+                    task_id,
+                )
+
+                # ── Sub-step 2: Compile result classification ─────────────
+                compile_logs = []
+                if not compile_success:
+                    classified_errors = _classify_csmgvt_compile_failure(result)
+                    compile_logs.append("[CSMGVT][SUB2][ERROR] === Compile Failure Classification ===")
+                    for err in classified_errors:
+                        compile_logs.append(f"[CSMGVT][SUB2][ERROR] {err}")
+                    compile_logs.append("[CSMGVT][SUB2][INFO] Open Code Server to fix compilation errors and retry")
+                else:
+                    compile_logs.append("[CSMGVT][SUB2][SUCCESS] Compilation succeeded")
+                    build_dir = result.get("build_dir", "")
+                    if build_dir:
+                        compile_logs.append(f"[CSMGVT][SUB2][INFO] Build directory: {build_dir}")
+
+                _send_callback(
+                    callback_url,
+                    _callback_payload(
+                        {
+                        "status": "GENERATING",
+                        "subStatus": sub_status,
+                        "progress": p_start + (p_end - p_start) * 2 // 4,
+                        "logs": compile_logs,
+                        "csmgvtSubStep": "compile",
+                        "csmgvtCompileErrors": _classify_csmgvt_compile_failure(result) if not compile_success else [],
+                        },
+                        context,
+                    ),
+                    task_id,
+                )
+
+                # ── Sub-step 3: Run csm ──────────────────────────────────
+                csm_logs = []
+                csm_result = {"csmRan": False, "csmReturnCode": -1, "csmTimedOut": False, "csmTimeoutNormal": False}
+                build_dir = result.get("build_dir", "")
+                if compile_success and build_dir:
+                    csm_result = _run_csm_executable(build_dir)
+                    if csm_result["csmRan"]:
+                        rc = csm_result["csmReturnCode"]
+                        if csm_result["csmTimeoutNormal"]:
+                            csm_logs.append(f"[CSMGVT][SUB3][INFO] CSM execution timed out (return_code=124) — treated as normal stop")
+                        elif rc == 0:
+                            csm_logs.append("[CSMGVT][SUB3][SUCCESS] CSM execution completed successfully")
+                        else:
+                            csm_logs.append(f"[CSMGVT][SUB3][ERROR] CSM execution failed (return_code={rc})")
+                        for line in (csm_result.get("csmStdout") or "").splitlines()[:20]:
+                            if line.strip():
+                                csm_logs.append(f"[CSMGVT][SUB3][INFO] {line}")
+                    else:
+                        csm_logs.append(f"[CSMGVT][SUB3][WARN] CSM executable not found: {csm_result.get('csmStderr', '')}")
+                elif not compile_success:
+                    csm_logs.append("[CSMGVT][SUB3][SKIP] CSM not run — compilation failed")
+                else:
+                    csm_logs.append("[CSMGVT][SUB3][SKIP] CSM not run — no build directory found")
+
+                _send_callback(
+                    callback_url,
+                    _callback_payload(
+                        {
+                        "status": "GENERATING",
+                        "subStatus": sub_status,
+                        "progress": p_start + (p_end - p_start) * 3 // 4,
+                        "logs": csm_logs,
+                        "csmgvtSubStep": "run_csm",
+                        "csmgvtCsmResult": csm_result,
+                        },
+                        context,
+                    ),
+                    task_id,
+                )
+
+                # ── Sub-step 4: Check runtime.log ─────────────────────────
+                runtime_result = _check_csmgvt_runtime_log(steps_root, context)
+                runtime_logs = []
+                if runtime_result["runtimeLogFound"]:
+                    if runtime_result["isEmpty"]:
+                        runtime_logs.append("[CSMGVT][SUB4][WARN] runtime.log is empty — test framework ran but HARNESS did not write test cases")
+                        runtime_logs.append("[CSMGVT][SUB4][INFO] Open Code Server to add test logic in HARNESS functions")
+                    else:
+                        traces = runtime_result["keyTraces"]
+                        runtime_logs.append("[CSMGVT][SUB4][INFO] === Runtime Log Trace Check ===")
+                        for trace_name, found in traces.items():
+                            status_icon = "✓" if found else "✗"
+                            runtime_logs.append(f"[CSMGVT][SUB4][INFO] {status_icon} {trace_name}: {'found' if found else 'not found'}")
+                        if runtime_result["failureKeywords"]:
+                            for kw in runtime_result["failureKeywords"]:
+                                runtime_logs.append(f"[CSMGVT][SUB4][ERROR] Failure keyword detected: {kw}")
+                        else:
+                            runtime_logs.append("[CSMGVT][SUB4][INFO] No failure keywords detected in runtime.log")
+                else:
+                    runtime_logs.append("[CSMGVT][SUB4][INFO] No runtime.log found (csm may not have been executed)")
+
+                _send_callback(
+                    callback_url,
+                    _callback_payload(
+                        {
+                        "status": "GENERATING",
+                        "subStatus": sub_status,
+                        "progress": p_end,
+                        "logs": runtime_logs,
+                        "csmgvtSubStep": "check_log",
+                        "csmgvtResult": runtime_result,
+                        },
+                        context,
+                    ),
+                    task_id,
+                )
             continue
 
         had_failure = True
@@ -563,6 +988,11 @@ def _run_pipeline(
         else:
             rc = result.get("compile_return_code", -1)
             fail_logs = [f"[{phase_id}][COMPILE][ERROR] Compilation failed (return_code={rc})"]
+            # CSMGVT: add classified error hints
+            if tool_id == "csmgvt":
+                classified = _classify_csmgvt_compile_failure(result)
+                for err in classified:
+                    fail_logs.append(f"[{phase_id}][COMPILE][ERROR] {err}")
 
         if continue_on_error:
             fail_logs.append(f"[{phase_id}][WARN] continueOnError=true, continuing after {tool_id} failure.")
@@ -597,11 +1027,51 @@ def _run_pipeline(
             logger.error("[Pipeline] FAILED at %s, aborting task %s", tool_id, task_id)
             return
 
+    # ── Source readiness gate before CSMGVT/LDP ────────────────────────────
+    if not had_failure and not continuing:
+        execution_phases = {"CSMGVT", "LDP"}
+        selected_set = set(selected_phases)
+        if selected_set.intersection(execution_phases) and mode == "INTEGRATION":
+            # INTEGRATION mode: source must be ready before CSMGVT/LDP
+            source_ready_evidence = phase_params.get("_meta", {}).get("sourceReadinessEvidence")
+            if not source_ready_evidence:
+                _send_callback(
+                    callback_url,
+                    _callback_payload(
+                        {
+                            "status": "SOURCE_PREP_REQUIRED",
+                            "subStatus": "NONE",
+                            "progress": 100,
+                            "outputPath": output_path,
+                            "logs": [
+                                "[PIPELINE][ERROR] INTEGRATION mode requires source readiness confirmation before CSMGVT/LDP.",
+                                "[PIPELINE][INFO] Provide sourceReadinessEvidence or prepare source via Code Server first.",
+                            ],
+                        },
+                        context,
+                    ),
+                    task_id,
+                )
+                logger.error("[Pipeline] SOURCE_PREP_REQUIRED for INTEGRATION task=%s", task_id)
+                return
+
+    # ── CSMGVT source integrity pre-check ───────────────────────────────────
+    if not had_failure and not continuing:
+        for step in pipeline_steps:
+            if step["phaseId"] == "CSMGVT" and mode in ("HARNESS", "HARNESS_DEV"):
+                _check_csmgvt_source_integrity(steps_root, context, callback_url, task_id, output_path)
+                # If integrity check failed, a FAILED callback was already sent
+                if not (steps_root / context.active_project_file).exists():
+                    return
+                break
+
     status = "AWAITING_CODE" if should_await_code(mode, selected_phases, had_failure, continuing) else "COMPLETED"
     if status == "AWAITING_CODE":
+        code_workspace = str(steps_root.parent)  # /workspace/{projectId}/{workspaceId}/src
         final_logs = [
             "[PIPELINE][INFO] Skeleton generation finished.",
             "[PIPELINE][INFO] Open Code Server, add your business code, then continue with CSMGVT or LDP.",
+            f"[PIPELINE][INFO] Code workspace path: {code_workspace}",
         ]
     else:
         final_logs = [
@@ -612,18 +1082,20 @@ def _run_pipeline(
             final_logs.append("[PIPELINE][WARN] Some phases failed, but the pipeline continued because continueOnError=true.")
 
     logger.info("[Pipeline] %s task=%s, outputPath=%s", status, task_id, output_path)
+    final_payload = {
+        "status": status,
+        "subStatus": "NONE",
+        "progress": 100,
+        "outputPath": output_path,
+        "logs": final_logs,
+    }
+    if status == "AWAITING_CODE":
+        code_workspace = str(steps_root.parent) if steps_root else output_path
+        final_payload["codeWorkspacePath"] = code_workspace
+        final_payload["sourceState"] = "GENERATED_SKELETON"
     _send_callback(
         callback_url,
-        _callback_payload(
-            {
-            "status": status,
-            "subStatus": "NONE",
-            "progress": 100,
-            "outputPath": output_path,
-            "logs": final_logs,
-            },
-            context,
-        ),
+        _callback_payload(final_payload, context),
         task_id,
     )
 
@@ -703,6 +1175,7 @@ def trigger_generation():
     base_project_file = data.get("baseProjectFile") or data.get("base_project_file")
     active_project_file = data.get("activeProjectFile") or data.get("active_project_file")
     harness_project_file = data.get("harnessProjectFile") or data.get("harness_project_file")
+    source_readiness_evidence = data.get("sourceReadinessEvidence") or data.get("source_readiness_evidence")
 
     if step_name == "generate_harness":
         steps_dir = data.get("steps_dir") or data.get("stepsDir")
@@ -736,6 +1209,7 @@ def trigger_generation():
     continue_on_error = bool(data.get("continueOnError", False))
     phase_params = data.get("phaseParams", {})
     skip_export = bool(data.get("skipExport", False))
+    # Continuing runs must always skip export to preserve user code
     continuing = False
 
     if not task_id or not project_id or not callback_url:
@@ -780,6 +1254,12 @@ def trigger_generation():
         phase_params,
     )
 
+    # Inject sourceReadinessEvidence into phase_params._meta for pipeline access
+    if source_readiness_evidence:
+        if "_meta" not in phase_params:
+            phase_params["_meta"] = {}
+        phase_params["_meta"]["sourceReadinessEvidence"] = source_readiness_evidence
+
     thread = threading.Thread(
         target=_run_pipeline,
         args=(
@@ -802,3 +1282,191 @@ def trigger_generation():
     thread.start()
 
     return jsonify({"message": "Accepted", "taskId": task_id}), 202
+
+
+# ── Code Backflow Endpoints ─────────────────────────────────────────────────
+
+
+@bp.post("/api/backflow/scan")
+def backflow_scan():
+    """Scan HARNESS workspace for returnable and excluded files.
+
+    Request body:
+        taskId: str
+        projectId: str
+        workspaceId: str
+        returnableComponents: list[str] | null  (optional component filter)
+
+    Returns:
+        returnableFiles: list of {relativePath, isNew}
+        excludedFiles: list of {relativePath, exclusionReason}
+    """
+    body = request.get_json(force=True)
+    task_id = body.get("taskId", "")
+    project_id = body.get("projectId", "")
+    workspace_id = body.get("workspaceId", "")
+    returnable_components = body.get("returnableComponents")
+
+    steps_root = WORKSPACE_ROOT / project_id / workspace_id / "src"
+    if not steps_root.exists():
+        return jsonify({"error": f"Workspace not found: {steps_root}"}), 404
+
+    # Determine source root: typically the base project directory
+    # For HARNESS mode, source of truth is the original project before HARNESS overlay
+    source_root = steps_root  # Default: same workspace
+
+    returnable, excluded = scan_backflow_files(
+        harness_workspace=steps_root,
+        source_root=source_root,
+        returnable_components=returnable_components,
+    )
+
+    return jsonify({
+        "taskId": task_id,
+        "returnableFiles": [
+            {"relativePath": bf.relative_path, "isNew": bf.is_new}
+            for bf in returnable
+        ],
+        "excludedFiles": [
+            {"relativePath": bf.relative_path, "exclusionReason": bf.exclusion_reason}
+            for bf in excluded
+        ],
+    })
+
+
+@bp.post("/api/backflow/patch")
+def backflow_generate_patch():
+    """Generate a backflow patch from HARNESS workspace.
+
+    Request body:
+        taskId: str
+        projectId: str
+        workspaceId: str
+        returnableComponents: list[str] | null
+
+    Returns:
+        patchContent: str (unified diff)
+        patchHash: str
+        returnableFiles: list of {relativePath, isNew, isConflict, conflictReason}
+        hasConflicts: bool
+        conflictFiles: list
+    """
+    body = request.get_json(force=True)
+    task_id = body.get("taskId", "")
+    project_id = body.get("projectId", "")
+    workspace_id = body.get("workspaceId", "")
+    returnable_components = body.get("returnableComponents")
+
+    steps_root = WORKSPACE_ROOT / project_id / workspace_id / "src"
+    if not steps_root.exists():
+        return jsonify({"error": f"Workspace not found: {steps_root}"}), 404
+
+    source_root = steps_root
+
+    returnable, excluded = scan_backflow_files(
+        harness_workspace=steps_root,
+        source_root=source_root,
+        returnable_components=returnable_components,
+    )
+
+    patch = generate_patch(returnable, task_id)
+
+    return jsonify({
+        "taskId": task_id,
+        "patchContent": patch.patch_content,
+        "patchHash": patch.patch_hash,
+        "returnableFiles": [
+            {
+                "relativePath": bf.relative_path,
+                "isNew": bf.is_new,
+                "isConflict": bf.is_conflict,
+                "conflictReason": bf.conflict_reason,
+            }
+            for bf in patch.returnable_files
+        ],
+        "hasConflicts": patch.has_conflicts,
+        "conflictFiles": [
+            {
+                "relativePath": bf.relative_path,
+                "conflictReason": bf.conflict_reason,
+            }
+            for bf in patch.conflict_files
+        ],
+    })
+
+
+@bp.post("/api/backflow/apply")
+def backflow_apply():
+    """Apply a backflow patch to the source of truth.
+
+    Request body:
+        taskId: str
+        projectId: str
+        workspaceId: str
+        returnableComponents: list[str] | null
+        mode: "overwrite" | "new_version"
+        callbackUrl: str  (for status update)
+
+    Returns:
+        success: bool
+        appliedFiles: list[str]
+        skippedFiles: list[str]
+        conflictFiles: list[str]
+        patchArtifactPath: str | null
+        sourceRevision: str
+    """
+    body = request.get_json(force=True)
+    task_id = body.get("taskId", "")
+    project_id = body.get("projectId", "")
+    workspace_id = body.get("workspaceId", "")
+    returnable_components = body.get("returnableComponents")
+    mode = body.get("mode", "overwrite")
+    callback_url = body.get("callbackUrl", "")
+
+    steps_root = WORKSPACE_ROOT / project_id / workspace_id / "src"
+    if not steps_root.exists():
+        return jsonify({"error": f"Workspace not found: {steps_root}"}), 404
+
+    source_root = steps_root
+    patch_artifact_dir = steps_root / "backflow-artifacts"
+
+    returnable, excluded = scan_backflow_files(
+        harness_workspace=steps_root,
+        source_root=source_root,
+        returnable_components=returnable_components,
+    )
+
+    patch = generate_patch(returnable, task_id)
+    result = apply_patch(patch, source_root, mode=mode, patch_artifact_dir=patch_artifact_dir)
+
+    # Send callback to Java backend with backflow result
+    if callback_url:
+        try:
+            callback_payload = {
+                "status": "COMPLETED" if result.success else "FAILED",
+                "subStatus": "CODE_BACKFLOW_APPLIED" if result.success and not result.conflict_files else "CONFLICT" if result.conflict_files else "NONE",
+                "progress": 100,
+                "logs": [
+                    f"[BACKFLOW][INFO] Patch applied: {len(result.applied_files)} files",
+                    f"[BACKFLOW][INFO] Skipped: {len(result.skipped_files)} files",
+                    f"[BACKFLOW][INFO] Conflicts: {len(result.conflict_files)} files",
+                    f"[BACKFLOW][INFO] Source revision: {result.source_revision}",
+                ],
+                "sourceRevision": result.source_revision,
+                "patchArtifactPath": result.patch_artifact_path,
+            }
+            if result.error_message:
+                callback_payload["logs"].append(f"[BACKFLOW][ERROR] {result.error_message}")
+            requests.post(callback_url, json=callback_payload, timeout=10)
+        except Exception as exc:
+            logger.error("[Backflow] Callback failed: %s", exc)
+
+    return jsonify({
+        "success": result.success,
+        "appliedFiles": result.applied_files,
+        "skippedFiles": result.skipped_files,
+        "conflictFiles": result.conflict_files,
+        "errorMessage": result.error_message,
+        "patchArtifactPath": result.patch_artifact_path,
+        "sourceRevision": result.source_revision,
+    })

@@ -59,6 +59,11 @@ class GeneratorWorkflowModeTests(unittest.TestCase):
             resolve_phase_steps("HARNESS", selected_phases=None, continuing=False),
             ["EXVT", "ASCTG", "MSCIGT"],
         )
+        # HARNESS maps to HARNESS_DEV internally
+        self.assertEqual(
+            default_selected_phases("HARNESS_DEV", continuing=False),
+            ["EXVT", "ASCTG", "MSCIGT"],
+        )
 
     def test_integration_phase_order_omits_asctg_and_mscigt(self):
         self.assertEqual(
@@ -77,7 +82,7 @@ class GeneratorWorkflowModeTests(unittest.TestCase):
     def test_harness_initial_request_rejects_execution_phases(self):
         with self.assertRaisesRegex(
             ValueError,
-            "HARNESS initial runs only allow EXVT, ASCTG and MSCIGT",
+            "HARNESS_DEV initial runs only allow EXVT, ASCTG and MSCIGT",
         ):
             validate_phase_selection(
                 "HARNESS",
@@ -88,7 +93,7 @@ class GeneratorWorkflowModeTests(unittest.TestCase):
     def test_harness_continue_request_rejects_modeling_phases(self):
         with self.assertRaisesRegex(
             ValueError,
-            "HARNESS continue runs only allow CSMGVT and LDP",
+            "HARNESS_DEV continue runs only allow CSMGVT and LDP",
         ):
             validate_phase_selection(
                 "HARNESS",
@@ -120,8 +125,8 @@ class GeneratorWorkflowModeTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
         payload = response.get_json()
-        self.assertEqual(payload["error"], "HARNESS initial runs only allow EXVT, ASCTG and MSCIGT")
-        self.assertEqual(payload["message"], "HARNESS initial runs only allow EXVT, ASCTG and MSCIGT")
+        self.assertEqual(payload["error"], "HARNESS_DEV initial runs only allow EXVT, ASCTG and MSCIGT")
+        self.assertEqual(payload["message"], "HARNESS_DEV initial runs only allow EXVT, ASCTG and MSCIGT")
 
     def test_harness_continue_request_rejects_modeling_phases_at_request_level(self):
         client = self.app.test_client()
@@ -140,8 +145,8 @@ class GeneratorWorkflowModeTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
         payload = response.get_json()
-        self.assertEqual(payload["error"], "HARNESS continue runs only allow CSMGVT and LDP")
-        self.assertEqual(payload["message"], "HARNESS continue runs only allow CSMGVT and LDP")
+        self.assertEqual(payload["error"], "HARNESS_DEV continue runs only allow CSMGVT and LDP")
+        self.assertEqual(payload["message"], "HARNESS_DEV continue runs only allow CSMGVT and LDP")
 
     def test_explicit_empty_selected_phases_is_rejected(self):
         client = self.app.test_client()
@@ -266,19 +271,47 @@ class GeneratorWorkflowModeTests(unittest.TestCase):
             ],
         )
         self.assertEqual(callbacks[-1]["status"], "AWAITING_CODE")
-        self.assertEqual(callbacks[-1]["workflowMode"], "HARNESS")
+        self.assertEqual(callbacks[-1]["workflowMode"], "HARNESS_DEV")
         self.assertEqual(callbacks[-1]["baseProjectFile"], "base.project.xml")
         self.assertEqual(callbacks[-1]["activeProjectFile"], "base-harness.project.xml")
         self.assertEqual(callbacks[-1]["harnessProjectFile"], "base-harness.project.xml")
 
     def test_harness_only_enters_awaiting_code_after_mscigt(self):
         self.assertTrue(should_await_code("HARNESS", ["EXVT", "MSCIGT"], had_failure=False, continuing=False))
+        self.assertTrue(should_await_code("HARNESS_DEV", ["EXVT", "MSCIGT"], had_failure=False, continuing=False))
+
+    def test_direct_dev_enters_awaiting_code_after_mscigt(self):
+        self.assertTrue(should_await_code("DIRECT_DEV", ["EXVT", "MSCIGT"], had_failure=False, continuing=False))
+
+    def test_direct_dev_default_initial_phases(self):
+        self.assertEqual(
+            default_selected_phases("DIRECT_DEV", continuing=False),
+            ["EXVT", "MSCIGT"],
+        )
+        self.assertEqual(
+            default_selected_phases("DIRECT_DEV", continuing=True),
+            ["CSMGVT", "LDP"],
+        )
+
+    def test_direct_dev_initial_rejects_asctg(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "DIRECT_DEV initial runs only allow EXVT and MSCIGT",
+        ):
+            validate_phase_selection(
+                "DIRECT_DEV",
+                ["EXVT", "ASCTG"],
+                continuing=False,
+            )
 
     def test_harness_does_not_enter_awaiting_code_after_only_asctg(self):
         self.assertFalse(should_await_code("HARNESS", ["ASCTG"], had_failure=False, continuing=False))
 
     def test_integration_never_enters_awaiting_code(self):
         self.assertFalse(should_await_code("INTEGRATION", ["EXVT", "MSCIGT"], had_failure=False, continuing=False))
+
+    def test_direct_dev_does_not_enter_awaiting_code_if_continuing(self):
+        self.assertFalse(should_await_code("DIRECT_DEV", ["EXVT", "MSCIGT"], had_failure=False, continuing=True))
 
     def test_asctg_with_no_harness_project_file_fails_cleanly(self):
         callbacks: list[dict] = []
@@ -417,7 +450,7 @@ class GeneratorWorkflowModeTests(unittest.TestCase):
                 )
 
         self.assertEqual(recorded_tool_runs, [("csmgvt", "base-harness.project.xml")])
-        self.assertEqual(callbacks[-1]["workflowMode"], "HARNESS")
+        self.assertEqual(callbacks[-1]["workflowMode"], "HARNESS_DEV")
         self.assertEqual(callbacks[-1]["activeProjectFile"], "base-harness.project.xml")
 
 
